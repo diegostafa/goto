@@ -1695,8 +1695,10 @@ fn visit_dir(dir: PathBuf) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![dir];
 
     while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
             let path = entry.path();
             if path.is_dir() {
                 dirs.push(path);
