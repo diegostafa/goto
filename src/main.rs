@@ -1252,7 +1252,7 @@ impl Keys {
     }
 }
 struct IconCache {
-    icons: HashMap<Window, Pixmap>,
+    icons: HashMap<(String, String), Pixmap>,
 }
 impl IconCache {
     fn new() -> Self {
@@ -1262,30 +1262,32 @@ impl IconCache {
     }
     fn refresh(&mut self, conn: &impl Connection, atoms: &AtomCollection, task: &Task) {
         if let Ok(icon) = get_net_wm_icon(conn, atoms, task.wid) {
-            self.icons.insert(task.wid, icon);
+            self.icons.insert(task.class.clone(), icon);
             return;
         }
         if let Ok(icon) = get_hicolor_icon(task) {
-            self.icons.insert(task.wid, icon);
+            self.icons.insert(task.class.clone(), icon);
             return;
         }
-        if let Ok(Some(parent)) = get_window_parent(conn, atoms, task.wid)
-            && let Some(icon) = self.icons.get(&parent)
+        if let Ok(Some(wid)) = get_window_parent(conn, atoms, task.wid)
+            && let Some(parent) = window_to_task(conn, atoms, wid)
+            && let Some(icon) = self.icons.get(&parent.class)
         {
-            self.icons.insert(task.wid, icon.clone());
+            self.icons.insert(task.class.clone(), icon.clone());
             return;
         }
-        self.icons.insert(task.wid, Pixmap::new(1, 1).unwrap());
+        self.icons
+            .insert(task.class.clone(), Pixmap::new(1, 1).unwrap());
     }
     fn cache(&mut self, conn: &impl Connection, atoms: &AtomCollection, tasks: &TaskList) {
         for task in tasks.list_ascending().0 {
-            if !self.icons.contains_key(&task.wid) {
+            if !self.icons.contains_key(&task.class) {
                 self.refresh(conn, atoms, task);
             }
         }
     }
     fn get(&mut self, task: &Task) -> &Pixmap {
-        self.icons.get(&task.wid).unwrap()
+        self.icons.get(&task.class).unwrap()
     }
 }
 fn create_window(
