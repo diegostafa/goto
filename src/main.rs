@@ -1,4 +1,4 @@
-#![allow(unused)]
+// #![allow(unused)]
 #![allow(clippy::identity_op)]
 
 use fontdue::layout::{
@@ -1168,6 +1168,7 @@ atom_manager! {
         CARDINAL,
         STRING,
         WINDOW,
+        WM_TRANSIENT_FOR,
 
         _NET_WM_PID,
         _NET_WM_STATE,
@@ -1251,7 +1252,7 @@ impl Keys {
     }
 }
 struct IconCache {
-    icons: HashMap<(String, String), Pixmap>,
+    icons: HashMap<Window, Pixmap>,
 }
 impl IconCache {
     fn new() -> Self {
@@ -1260,21 +1261,31 @@ impl IconCache {
         }
     }
     fn refresh(&mut self, conn: &impl Connection, atoms: &AtomCollection, task: &Task) {
-        let icon = get_net_wm_icon(conn, atoms, task.wid)
-            .or_else(|_| get_hicolor_icon(task))
-            .unwrap_or_else(|_| Pixmap::new(1, 1).unwrap());
-
-        self.icons.insert(task.class.clone(), icon);
+        if let Ok(icon) = get_net_wm_icon(conn, atoms, task.wid) {
+            self.icons.insert(task.wid, icon);
+            return;
+        }
+        if let Ok(icon) = get_hicolor_icon(task) {
+            self.icons.insert(task.wid, icon);
+            return;
+        }
+        if let Ok(Some(parent)) = get_window_parent(conn, atoms, task.wid)
+            && let Some(icon) = self.icons.get(&parent)
+        {
+            self.icons.insert(task.wid, icon.clone());
+            return;
+        }
+        self.icons.insert(task.wid, Pixmap::new(1, 1).unwrap());
     }
     fn cache(&mut self, conn: &impl Connection, atoms: &AtomCollection, tasks: &TaskList) {
         for task in tasks.list_ascending().0 {
-            if !self.icons.contains_key(&task.class) {
+            if !self.icons.contains_key(&task.wid) {
                 self.refresh(conn, atoms, task);
             }
         }
     }
     fn get(&mut self, task: &Task) -> &Pixmap {
-        self.icons.get(&task.class).unwrap()
+        self.icons.get(&task.wid).unwrap()
     }
 }
 fn create_window(
@@ -1523,6 +1534,21 @@ fn get_window_class(
         .and_then(|s| String::from_utf8(s.to_vec()).ok())
         .unwrap_or_default();
     Ok((instance, class))
+}
+fn get_window_parent(
+    conn: &impl Connection,
+    atoms: &AtomCollection,
+    wid: Window,
+) -> Result<Option<Window>> {
+    let reply = conn
+        .get_property(false, wid, atoms.WM_TRANSIENT_FOR, atoms.WINDOW, 0, 1)?
+        .reply()?;
+    if reply.value_len == 0 {
+        Ok(None)
+    } else {
+        let window_id = u32::from_ne_bytes(reply.value[..4].try_into()?);
+        Ok(Some(window_id))
+    }
 }
 fn _get_window_pid(
     conn: &impl Connection,
