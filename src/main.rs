@@ -1124,7 +1124,7 @@ fn _draw_vline(pm: &mut Pixmap, color: &Color, width: f32, x: f32, y1: f32, y2: 
 }
 fn gen_text_layout(text: &str, conf: &Config, glyphs: &mut GlyphCache, area: Area) -> Layout {
     let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
-    layout.reset(&LayoutSettings {
+    let mut settings = LayoutSettings {
         x: area.x,
         y: area.y,
         max_width: Some(area.w),
@@ -1134,8 +1134,18 @@ fn gen_text_layout(text: &str, conf: &Config, glyphs: &mut GlyphCache, area: Are
         wrap_style: WrapStyle::Word,
         wrap_hard_breaks: true,
         line_height: conf.line_height,
-    });
+    };
+    layout.reset(&settings);
+    layout.append(&glyphs.fonts, &TextStyle::new(text, glyphs.size, 0));
 
+    if layout.height() > area.h {
+        settings.vertical_align = VerticalAlign::Top;
+        layout.reset(&settings);
+        layout.append(&glyphs.fonts, &TextStyle::new(text, glyphs.size, 0));
+    }
+    layout
+
+    // // use the appropriate font for the character layout
     // let char_and_font_idx = text.chars().map(|c| (c, glyphs.font_idx_for_char(c)));
     // let mut segment = String::with_capacity(text.len());
     // let mut segment_idx = None;
@@ -1151,9 +1161,6 @@ fn gen_text_layout(text: &str, conf: &Config, glyphs: &mut GlyphCache, area: Are
     // if !segment.is_empty() {
     //     let idx = segment_idx.unwrap_or(0);
     // }
-
-    layout.append(&glyphs.fonts, &TextStyle::new(text, glyphs.size, 0));
-    layout
 }
 
 // --- x11
