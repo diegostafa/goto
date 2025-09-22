@@ -68,7 +68,7 @@ fn main() -> Result<()> {
         icons.cache(conn, atoms, &tasks);
     }
     let mut geometry =
-        compute_window_geometry(conf, screen, &tasks).unwrap_or((0.0, 0.0, 1.0, 1.0).into());
+        compute_window_geometry(conf, screen, tasks.len()).unwrap_or((0.0, 0.0, 1.0, 1.0).into());
     let this_window = create_window(conn, screen, atoms, geometry, depth, visual)?;
     let mut pixmap = Pixmap::new(geometry.w as u32, geometry.h as u32).unwrap();
     let gc = create_graphic_context(conn, this_window)?;
@@ -185,10 +185,11 @@ fn main() -> Result<()> {
         }
 
         if size_changed {
-            let Some(g) = compute_window_geometry(conf, screen, &tasks) else {
+            let Some(g) = compute_window_geometry(conf, screen, tasks.len()) else {
                 hide!();
                 continue;
             };
+
             geometry = g;
             request_window_move(conn, this_window, geometry)?;
             pixmap = Pixmap::new(geometry.w as u32, geometry.h as u32).unwrap();
@@ -198,12 +199,8 @@ fn main() -> Result<()> {
             && !tasks.is_empty()
             && (focus_changed || title_changed || icons_changed || window_changed)
         {
-            match conf.layout {
-                ListLayout::Rows => draw_list_rows(&mut pixmap, conf, &tasks, glyphs, icons),
-                ListLayout::Columns => unimplemented!(),
-                ListLayout::Grid => unimplemented!(),
-            };
-            request_window_draw(conn, this_window, gc, &pixmap, depth)?;
+            draw_list(&mut pixmap, conf, &tasks, glyphs, icons);
+            send_window_pixmap(conn, this_window, gc, &pixmap, depth)?;
         }
     }
 }
@@ -213,9 +210,8 @@ fn main() -> Result<()> {
 enum ListLayout {
     Rows,
     Columns,
-    Grid,
 }
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum Size {
     Absolute(u32),
     Relative(f32),
@@ -662,11 +658,7 @@ fn str_to_list_layout(value: &str) -> Result<ListLayout> {
     match value.to_lowercase().as_str() {
         "rows" => Ok(ListLayout::Rows),
         "columns" => Ok(ListLayout::Columns),
-        "grid" => Ok(ListLayout::Grid),
-        _ => Err(format!(
-            "invalid list layout: `{value}`, expecting: `vertical`, `horizontal` or `grid`"
-        )
-        .into()),
+        _ => Err(format!("invalid list layout: `{value}`, expecting: `rows`, `columns`").into()),
     }
 }
 
@@ -904,6 +896,18 @@ impl GlyphCache {
         (metrics, bitmap)
     }
 }
+fn draw_list(
+    pm: &mut Pixmap,
+    conf: &Config,
+    tasks: &TaskList,
+    glyphs: &mut GlyphCache,
+    icons: &mut IconCache,
+) {
+    match conf.layout {
+        ListLayout::Rows => draw_list_rows(pm, conf, tasks, glyphs, icons),
+        ListLayout::Columns => draw_list_cols(pm, conf, tasks, glyphs, icons),
+    }
+}
 fn draw_list_rows(
     pm: &mut Pixmap,
     conf: &Config,
@@ -987,15 +991,89 @@ fn draw_list_rows(
         }
     }
 }
-fn _draw_list_cols(
-    _pm: &mut Pixmap,
-    _conf: &Config,
-    _tasks: &TaskList,
-    _glyphs: &mut GlyphCache,
-    _icons: &mut IconCache,
+fn draw_list_cols(
+    pm: &mut Pixmap,
+    conf: &Config,
+    tasks: &TaskList,
+    glyphs: &mut GlyphCache,
+    icons: &mut IconCache,
 ) {
-}
+    let (list, Some(selected_idx)) = tasks.list_descending() else {
+        return;
+    };
+    let mut area = Area::from((0.0, 0.0, pm.width() as f32, pm.height() as f32));
+    draw_rect(pm, &conf.bg_color, area);
+    draw_rect_outline(pm, conf.border_width, &conf.border_color, area);
+    area = area.shrink(conf.border_width);
 
+    let task_w = area.w / tasks.len() as f32;
+
+    let icon_y = area.y;
+    let icon_h = if conf.show_icons { task_w } else { 0.0 };
+
+    let marker_h = if conf.show_marker {
+        conf.marker_width.unwrap_or(task_w)
+    } else {
+        0.0
+    };
+    let marker_y = area.y + area.h - marker_h;
+
+    let task_y = area.y + icon_h;
+    let task_h = area.h - icon_h - marker_h;
+
+    for (i, task) in list.enumerate() {
+        let x = area.x + task_w * i as f32;
+        let is_selected = i == selected_idx;
+
+        // left
+        if conf.show_icons {
+            let icon = icons.get(task);
+            let icon_area = (x, icon_y, icon_h, icon_h);
+            draw_icon(pm, conf, icon, icon_area.into());
+        }
+
+        // center
+        let task_area = (x, task_y, task_w, task_h);
+        if is_selected {
+            let style = conf.selected_task_style();
+            draw_task(pm, conf, task, glyphs, &style, task_area.into());
+        } else {
+            let mut style = conf.task_style();
+            let step = 1.0 - (i as f32 / tasks.len() as f32);
+            let gradient = Color::from_rgba8(
+                (step * 255.0 * style.bg_color.red()) as u8,
+                (step * 255.0 * style.bg_color.green()) as u8,
+                (step * 255.0 * style.bg_color.blue()) as u8,
+                (step * 255.0 * style.bg_color.alpha()) as u8,
+            );
+            if conf.task_gradient {
+                style.bg_color = &gradient;
+            }
+            draw_task(pm, conf, task, glyphs, &style, task_area.into());
+        };
+
+        // right
+        if conf.show_marker {
+            let marker_area = (x, marker_y, task_h, marker_h);
+            // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
+            if is_selected {
+                draw_marker(pm, conf, glyphs, marker_area.into());
+            }
+        }
+
+        // row separator
+        // if i != 0 {
+        //     _draw_vline(
+        //         pm,
+        //         &conf.row_sep_color,
+        //         conf.row_sep_width,
+        //         y,
+        //         area.x,
+        //         area.x + area.w,
+        //     );
+        // }
+    }
+}
 fn draw_marker(pm: &mut Pixmap, conf: &Config, glyphs: &mut GlyphCache, area: Area) {
     let mut buf = [0u8; 4];
     let marker_str = conf.marker.encode_utf8(&mut buf);
@@ -1363,7 +1441,7 @@ fn create_window(
 
     Ok(window)
 }
-fn request_window_draw(
+fn send_window_pixmap(
     conn: &impl Connection,
     wid: Window,
     gc: Gcontext,
@@ -1699,13 +1777,20 @@ fn window_to_task(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -
 fn apply_dpi(val: f32, dpi: f32) -> f32 {
     val * dpi / 72.0
 }
-fn compute_window_geometry(conf: &Config, screen: &Screen, tasks: &TaskList) -> Option<Area> {
-    if tasks.is_empty() {
+fn compute_window_geometry(conf: &Config, screen: &Screen, tasks: usize) -> Option<Area> {
+    match conf.layout {
+        ListLayout::Rows => compute_window_geometry_row(conf, screen, tasks),
+        ListLayout::Columns => compute_window_geometry_col(conf, screen, tasks),
+    }
+}
+fn compute_window_geometry_row(conf: &Config, screen: &Screen, tasks: usize) -> Option<Area> {
+    if tasks == 0 {
         return None;
     }
-    let task_h = compute_task_height(conf, screen, tasks.len());
+    let screen_size = screen.height_in_pixels as f32;
+    let task_h = compute_task_size(conf, screen_size, conf.task_height, tasks);
     let w = conf.width;
-    let h = task_h * tasks.len() as f32;
+    let h = task_h * tasks as f32;
     let screen_w = screen.width_in_pixels as f32;
     let screen_h = screen.height_in_pixels as f32;
     let (x, y) = conf.location.resolve((w, h), (screen_w, screen_h));
@@ -1714,15 +1799,31 @@ fn compute_window_geometry(conf: &Config, screen: &Screen, tasks: &TaskList) -> 
     }
     Some((x, y, w, h).into())
 }
-fn compute_task_height(conf: &Config, screen: &Screen, tasks: usize) -> f32 {
+fn compute_window_geometry_col(conf: &Config, screen: &Screen, tasks: usize) -> Option<Area> {
+    if tasks == 0 {
+        return None;
+    }
+    let screen_size = screen.width_in_pixels as f32;
+    let task_size = compute_task_size(conf, screen_size, conf.task_width, tasks);
+    let w = task_size * tasks as f32;
+    let h = conf.height;
+    let screen_w = screen.width_in_pixels as f32;
+    let screen_h = screen.height_in_pixels as f32;
+    let (x, y) = conf.location.resolve((w, h), (screen_w, screen_h));
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some((x, y, w, h).into())
+}
+fn compute_task_size(conf: &Config, screen_size: f32, task_size: Size, tasks: usize) -> f32 {
     let bw = conf.border_width * 2.0;
-    let screen_h = screen.height_in_pixels as f32 - bw;
-    let task_h = conf.task_height.resolve(screen_h);
-    let content_h = task_h * tasks as f32 + bw;
-    if content_h <= screen_h {
-        task_h
+    let screen_size = screen_size - bw;
+    let task_size = task_size.resolve(screen_size);
+    let content_h = task_size * tasks as f32 + bw;
+    if content_h <= screen_size {
+        task_size
     } else {
-        (screen_h - bw) / tasks as f32
+        (screen_size - bw) / tasks as f32
     }
 }
 fn visit_dir(dir: PathBuf) -> Result<Vec<PathBuf>> {
