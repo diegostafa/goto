@@ -39,6 +39,7 @@ todo:
 - remove tiny_skia dependency?
 - columns layout
 */
+
 // --- main
 const APP_NAME: &str = "goto";
 const HICOLOR: &str = "/usr/share/icons/hicolor";
@@ -73,7 +74,7 @@ fn main() -> Result<()> {
     let mut pixmap = Pixmap::new(geometry.w as u32, geometry.h as u32).unwrap();
     let gc = create_graphic_context(conn, this_window)?;
 
-    let glyphs = &mut GlyphCache::new(conf);
+    let tr = &mut TextRenderer::new(conf);
     let mut is_mapped = false;
     let this_window_conf = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
 
@@ -199,7 +200,7 @@ fn main() -> Result<()> {
             && !tasks.is_empty()
             && (focus_changed || title_changed || icons_changed || window_changed)
         {
-            draw_list(&mut pixmap, conf, &tasks, glyphs, icons);
+            draw_list(&mut pixmap, conf, &tasks, tr, icons);
             send_window_pixmap(conn, this_window, gc, &pixmap, depth)?;
         }
     }
@@ -261,14 +262,13 @@ struct TaskStyle<'a> {
     border_color: &'a Color,
     border_width: f32,
 }
-#[derive(Debug)]
 struct Config {
     font_1: Option<PathBuf>,
     font_2: Option<PathBuf>,
     font_3: Option<PathBuf>,
     font_size: f32,
-    text_halign: i32,
-    text_valign: i32,
+    text_halign: HorizontalAlign,
+    text_valign: VerticalAlign,
     line_height: f32,
     show_marker: bool,
     marker: char,
@@ -316,8 +316,8 @@ impl Config {
             font_3: None,
             font_size: 11.0,
             line_height: 1.1,
-            text_halign: 0,
-            text_valign: 0,
+            text_halign: HorizontalAlign::Center,
+            text_valign: VerticalAlign::Middle,
             show_marker: true,
             marker: '•',
             marker_width: Some(10.0),
@@ -489,22 +489,6 @@ impl Config {
             border_width: self.selected_task_border_width,
         }
     }
-    fn text_halign(&self) -> HorizontalAlign {
-        match self.text_halign {
-            -1 => HorizontalAlign::Left,
-            0 => HorizontalAlign::Center,
-            1 => HorizontalAlign::Right,
-            _ => unreachable!(),
-        }
-    }
-    fn text_valign(&self) -> VerticalAlign {
-        match self.text_valign {
-            -1 => VerticalAlign::Top,
-            0 => VerticalAlign::Middle,
-            1 => VerticalAlign::Bottom,
-            _ => unreachable!(),
-        }
-    }
     fn config_path() -> Option<PathBuf> {
         if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
             return Some(PathBuf::from(xdg).join(format!("{APP_NAME}/config")));
@@ -622,29 +606,29 @@ fn str_to_font_path(value: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn str_to_halign(value: &str) -> Result<i32> {
+fn str_to_halign(value: &str) -> Result<HorizontalAlign> {
     let value = value.trim();
     if value.is_empty() {
         return Err("missing value".into());
     }
     match value.to_lowercase().as_str() {
-        "left" => Ok(-1),
-        "center" => Ok(0),
-        "right" => Ok(1),
+        "left" => Ok(HorizontalAlign::Left),
+        "center" => Ok(HorizontalAlign::Center),
+        "right" => Ok(HorizontalAlign::Right),
         _ => Err(
             format!("invalid alignment: `{value}`, expecting: `left`, `center` or `right`").into(),
         ),
     }
 }
-fn str_to_valign(value: &str) -> Result<i32> {
+fn str_to_valign(value: &str) -> Result<VerticalAlign> {
     let value = value.trim();
     if value.is_empty() {
         return Err("missing value".into());
     }
     match value.to_lowercase().as_str() {
-        "top" => Ok(-1),
-        "middle" => Ok(0),
-        "bottom" => Ok(1),
+        "top" => Ok(VerticalAlign::Top),
+        "middle" => Ok(VerticalAlign::Middle),
+        "bottom" => Ok(VerticalAlign::Bottom),
         _ => Err(
             format!("invalid alignment: `{value}`, expecting: `top`, `middle` or `bottom`").into(),
         ),
@@ -820,13 +804,14 @@ impl From<(f32, f32, f32, f32)> for Area {
     }
 }
 type RasterizedGlyph = (Metrics, Vec<u8>);
-struct GlyphCache {
+struct TextRenderer {
     ascii: [(Metrics, Vec<u8>); 256],
     others: HashMap<char, RasterizedGlyph>,
     fonts: Vec<Font>,
     size: f32,
+    layout: Layout,
 }
-impl GlyphCache {
+impl TextRenderer {
     pub fn new(conf: &Config) -> Self {
         let font_paths: Vec<_> = vec![&conf.font_1, &conf.font_2, &conf.font_3]
             .into_iter()
@@ -859,15 +844,42 @@ impl GlyphCache {
             others: HashMap::new(),
             fonts,
             size: conf.font_size,
+            layout: Layout::new(CoordinateSystem::PositiveYDown),
         }
     }
-    pub fn get(&mut self, c: char) -> &RasterizedGlyph {
-        self.cache(c);
+    pub fn get(&self, c: char) -> &RasterizedGlyph {
         self.ascii
             .get(c as usize)
             .or_else(|| self.others.get(&c))
             .unwrap()
     }
+    fn set_layout(&mut self, text: &str, conf: &Config, area: Area) {
+        for c in text.chars() {
+            self.cache(c);
+        }
+        let mut settings = LayoutSettings {
+            x: area.x,
+            y: area.y,
+            max_width: Some(area.w),
+            max_height: Some(area.h),
+            horizontal_align: conf.text_halign,
+            vertical_align: conf.text_valign,
+            wrap_style: WrapStyle::Word,
+            wrap_hard_breaks: true,
+            line_height: conf.line_height,
+        };
+        self.layout.reset(&settings);
+        self.layout
+            .append(&self.fonts, &TextStyle::new(text, self.size, 0));
+
+        if self.layout.height() > area.h {
+            settings.vertical_align = VerticalAlign::Top;
+            self.layout.reset(&settings);
+            self.layout
+                .append(&self.fonts, &TextStyle::new(text, self.size, 0));
+        }
+    }
+
     fn cache(&mut self, c: char) {
         if c.is_ascii() {
             return;
@@ -900,19 +912,19 @@ fn draw_list(
     pm: &mut Pixmap,
     conf: &Config,
     tasks: &TaskList,
-    glyphs: &mut GlyphCache,
+    tr: &mut TextRenderer,
     icons: &mut IconCache,
 ) {
     match conf.layout {
-        ListLayout::Rows => draw_list_rows(pm, conf, tasks, glyphs, icons),
-        ListLayout::Columns => draw_list_cols(pm, conf, tasks, glyphs, icons),
+        ListLayout::Rows => draw_list_rows(pm, conf, tasks, tr, icons),
+        ListLayout::Columns => draw_list_cols(pm, conf, tasks, tr, icons),
     }
 }
 fn draw_list_rows(
     pm: &mut Pixmap,
     conf: &Config,
     tasks: &TaskList,
-    glyphs: &mut GlyphCache,
+    tr: &mut TextRenderer,
     icons: &mut IconCache,
 ) {
     let (list, Some(selected_idx)) = tasks.list_descending() else {
@@ -937,6 +949,7 @@ fn draw_list_rows(
 
     let task_x = area.x + icon_w;
     let task_w = area.w - icon_w - marker_w;
+    let style = conf.selected_task_style();
 
     for (i, task) in list.enumerate() {
         let y = area.y + task_h * i as f32;
@@ -950,10 +963,9 @@ fn draw_list_rows(
         }
 
         // center
-        let task_area = (task_x, y, task_w, task_h);
+        let task_area = Area::from((task_x, y, task_w, task_h));
         if is_selected {
-            let style = conf.selected_task_style();
-            draw_task(pm, conf, task, glyphs, &style, task_area.into());
+            draw_task(pm, conf, task, tr, &style, task_area);
         } else {
             let mut style = conf.task_style();
             let step = 1.0 - (i as f32 / tasks.len() as f32);
@@ -966,15 +978,15 @@ fn draw_list_rows(
             if conf.task_gradient {
                 style.bg_color = &gradient;
             }
-            draw_task(pm, conf, task, glyphs, &style, task_area.into());
+            draw_task(pm, conf, task, tr, &style, task_area);
         };
 
         // right
         if conf.show_marker {
-            let marker_area = (marker_x, y, marker_w, task_h);
+            let marker_area = Area::from((marker_x, y, marker_w, task_h));
             // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
             if is_selected {
-                draw_marker(pm, conf, glyphs, marker_area.into());
+                draw_marker(pm, conf, tr, marker_area);
             }
         }
 
@@ -995,7 +1007,7 @@ fn draw_list_cols(
     pm: &mut Pixmap,
     conf: &Config,
     tasks: &TaskList,
-    glyphs: &mut GlyphCache,
+    tr: &mut TextRenderer,
     icons: &mut IconCache,
 ) {
     let (list, Some(selected_idx)) = tasks.list_descending() else {
@@ -1021,6 +1033,8 @@ fn draw_list_cols(
     let task_y = area.y + icon_h;
     let task_h = area.h - icon_h - marker_h;
 
+    let style = conf.selected_task_style();
+
     for (i, task) in list.enumerate() {
         let x = area.x + task_w * i as f32;
         let is_selected = i == selected_idx;
@@ -1033,10 +1047,9 @@ fn draw_list_cols(
         }
 
         // center
-        let task_area = (x, task_y, task_w, task_h);
+        let task_area = Area::from((x, task_y, task_w, task_h));
         if is_selected {
-            let style = conf.selected_task_style();
-            draw_task(pm, conf, task, glyphs, &style, task_area.into());
+            draw_task(pm, conf, task, tr, &style, task_area);
         } else {
             let mut style = conf.task_style();
             let step = 1.0 - (i as f32 / tasks.len() as f32);
@@ -1049,15 +1062,15 @@ fn draw_list_cols(
             if conf.task_gradient {
                 style.bg_color = &gradient;
             }
-            draw_task(pm, conf, task, glyphs, &style, task_area.into());
+            draw_task(pm, conf, task, tr, &style, task_area);
         };
 
         // right
         if conf.show_marker {
-            let marker_area = (x, marker_y, task_h, marker_h);
+            let marker_area = Area::from((x, marker_y, task_h, marker_h));
             // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
             if is_selected {
-                draw_marker(pm, conf, glyphs, marker_area.into());
+                draw_marker(pm, conf, tr, marker_area);
             }
         }
 
@@ -1074,12 +1087,12 @@ fn draw_list_cols(
         // }
     }
 }
-fn draw_marker(pm: &mut Pixmap, conf: &Config, glyphs: &mut GlyphCache, area: Area) {
+fn draw_marker(pm: &mut Pixmap, conf: &Config, tr: &mut TextRenderer, area: Area) {
     let mut buf = [0u8; 4];
     let marker_str = conf.marker.encode_utf8(&mut buf);
-    let layout = gen_text_layout(marker_str, conf, glyphs, area);
+    tr.set_layout(marker_str, conf, area);
     draw_rect(pm, &conf.marker_bg_color, area);
-    draw_text(pm, &layout, &conf.marker_fg_color, glyphs);
+    draw_text(pm, &conf.marker_fg_color, tr);
 }
 fn draw_icon(pm: &mut Pixmap, conf: &Config, icon: &Pixmap, mut area: Area) {
     draw_rect(pm, &conf.icon_bg_color, area);
@@ -1101,7 +1114,7 @@ fn draw_task(
     pm: &mut Pixmap,
     conf: &Config,
     task: &Task,
-    glyphs: &mut GlyphCache,
+    tr: &mut TextRenderer,
     style: &TaskStyle,
     area: Area,
 ) {
@@ -1109,17 +1122,17 @@ fn draw_task(
     draw_rect_outline(pm, style.border_width, style.border_color, area);
 
     let bw = conf.task_border_width.max(conf.selected_task_border_width);
-    let layout = gen_text_layout(&task.title, conf, glyphs, area.shrink(bw));
-    draw_text(pm, &layout, style.fg_color, glyphs);
+    tr.set_layout(&task.title, conf, area.shrink(bw));
+    draw_text(pm, style.fg_color, tr);
 }
-fn draw_text(pm: &mut Pixmap, layout: &Layout, color: &Color, glyphs: &mut GlyphCache) {
+fn draw_text(pm: &mut Pixmap, color: &Color, tr: &TextRenderer) {
     let p_stride = 4; // bgra
     let b_stride = 1; // grayscale
     let pixmap_width = pm.width() as usize;
     let pixmap = pm.data_mut();
 
-    for glyph_pos in layout.glyphs() {
-        let (metrics, bitmap) = glyphs.get(glyph_pos.parent);
+    for glyph_pos in tr.layout.glyphs() {
+        let (metrics, bitmap) = tr.get(glyph_pos.parent);
         for row in 0..metrics.height {
             for col in 0..metrics.width {
                 let b_offset = (row * metrics.width + col) * b_stride;
@@ -1144,6 +1157,7 @@ fn draw_rect_outline(pm: &mut Pixmap, bw: f32, color: &Color, area: Area) {
     if bw <= 0.0 {
         return;
     }
+
     let x = area.x;
     let y = area.y;
     let w = area.w;
@@ -1166,6 +1180,11 @@ fn draw_rect(pm: &mut Pixmap, color: &Color, area: Area) {
     let a = (color.alpha() * 255.0) as u8;
     let c = (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | (b as u32);
 
+    let x = area.x.floor() as u32;
+    let y = area.y.floor() as u32;
+    let w = area.w.ceil() as u32;
+    let h = area.h.ceil() as u32;
+
     let width = pm.width();
     let height = pm.height();
     let buf: &mut [u32] = unsafe {
@@ -1174,11 +1193,6 @@ fn draw_rect(pm: &mut Pixmap, color: &Color, area: Area) {
             (width * height) as usize,
         )
     };
-
-    let x = area.x.floor() as u32;
-    let y = area.y.floor() as u32;
-    let w = area.w.ceil() as u32;
-    let h = area.h.ceil() as u32;
 
     for row in y..y + h {
         let start = (row * width + x) as usize;
@@ -1199,46 +1213,6 @@ fn _draw_vline(pm: &mut Pixmap, color: &Color, width: f32, x: f32, y1: f32, y2: 
     }
     let ln = Area::from((x, y1, width, y2 - y1));
     draw_rect(pm, color, ln);
-}
-fn gen_text_layout(text: &str, conf: &Config, glyphs: &mut GlyphCache, area: Area) -> Layout {
-    let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
-    let mut settings = LayoutSettings {
-        x: area.x,
-        y: area.y,
-        max_width: Some(area.w),
-        max_height: Some(area.h),
-        horizontal_align: conf.text_halign(),
-        vertical_align: conf.text_valign(),
-        wrap_style: WrapStyle::Word,
-        wrap_hard_breaks: true,
-        line_height: conf.line_height,
-    };
-    layout.reset(&settings);
-    layout.append(&glyphs.fonts, &TextStyle::new(text, glyphs.size, 0));
-
-    if layout.height() > area.h {
-        settings.vertical_align = VerticalAlign::Top;
-        layout.reset(&settings);
-        layout.append(&glyphs.fonts, &TextStyle::new(text, glyphs.size, 0));
-    }
-    layout
-
-    // // use the appropriate font for the character layout
-    // let char_and_font_idx = text.chars().map(|c| (c, glyphs.font_idx_for_char(c)));
-    // let mut segment = String::with_capacity(text.len());
-    // let mut segment_idx = None;
-    // for (c, idx) in char_and_font_idx {
-    //     if idx != segment_idx {
-    //         let idx = segment_idx.unwrap_or(0);
-    //         layout.append(&glyphs.fonts, &TextStyle::new(&segment, glyphs.size, idx));
-    //         segment.clear();
-    //         segment_idx = Some(idx);
-    //     }
-    //     segment.push(c);
-    // }
-    // if !segment.is_empty() {
-    //     let idx = segment_idx.unwrap_or(0);
-    // }
 }
 
 // --- x11
