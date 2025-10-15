@@ -36,8 +36,7 @@ macro_rules! log_time {
 
 /*
 todo:
-- remove tiny_skia dependency?
-- columns layout
+- remove tiny_skia dependency
 */
 
 // --- main
@@ -61,7 +60,7 @@ fn main() -> Result<()> {
     let mut tasks = TaskList::new();
     let wids = get_windows(conn, screen, atoms).unwrap_or_default();
     tasks.diff_update(wids, conn, atoms);
-    if let Ok(wid) = get_active_window(conn, screen, atoms) {
+    if let Ok(Some(wid)) = get_active_window(conn, screen, atoms) {
         tasks.focus_by_wid(wid)
     }
     let icons = &mut IconCache::new();
@@ -131,8 +130,15 @@ fn main() -> Result<()> {
                         }
                     } else if e.atom == atoms._NET_ACTIVE_WINDOW {
                         if let Ok(wid) = get_active_window(conn, screen, atoms) {
-                            tasks.focus_by_wid(wid);
-                            focus_changed |= true;
+                            match wid {
+                                Some(wid) => {
+                                    tasks.focus_by_wid(wid);
+                                    focus_changed |= true;
+                                }
+                                None => {
+                                    tasks.unfocus();
+                                }
+                            }
                         }
                     } else if (e.atom == atoms._NET_WM_NAME || e.atom == atoms.WM_NAME)
                         && let Ok(title) = get_window_title(conn, atoms, e.window)
@@ -175,7 +181,11 @@ fn main() -> Result<()> {
                                 size_changed |= true;
                             }
                         } else if e.detail == kb.key_quit && is_mapped {
-                            tasks.select_end();
+                            if let Ok(Some(_)) = get_active_window(conn, screen, atoms) {
+                                tasks.select_end();
+                            } else {
+                                tasks.unfocus();
+                            }
                             hide!();
                         }
                     }
@@ -662,37 +672,28 @@ impl PartialEq for Task {
 #[derive(Debug)]
 struct TaskList {
     tasks: Vec<Task>,
-    selected: usize,
+    selected: Option<usize>,
 }
 impl TaskList {
     fn new() -> Self {
         Self {
             tasks: Vec::with_capacity(64),
-            selected: 0,
+            selected: None,
         }
     }
     fn selected(&self) -> Option<&Task> {
-        if self.is_empty() {
-            return None;
-        }
-        Some(&self.tasks[self.selected])
+        self.selected.map(|sel| &self.tasks[sel])
     }
     fn get_task_by_id(&self, wid: Window) -> Option<&Task> {
         self.tasks.iter().find(|task| task.wid == wid)
     }
     fn list_ascending(&self) -> (impl Iterator<Item = &Task>, Option<usize>) {
-        if self.is_empty() {
-            return Default::default();
-        }
-        (self.tasks.iter(), Some(self.selected))
+        (self.tasks.iter(), self.selected)
     }
     fn list_descending(&self) -> (impl Iterator<Item = &Task>, Option<usize>) {
-        if self.is_empty() {
-            return Default::default();
-        }
         (
             self.tasks.iter().rev(),
-            Some(self.len() - 1 - self.selected),
+            self.selected.map(|sel| self.len() - 1 - sel),
         )
     }
     fn is_empty(&self) -> bool {
@@ -739,24 +740,37 @@ impl TaskList {
     }
     fn untrack(&mut self, wid: Window) {
         self.tasks.retain(|task| task.wid != wid);
-        self.selected = self.selected.min(self.len() - 1);
+        if let Some(sel) = self.selected {
+            if let Some(last) = self.len().checked_sub(1) {
+                self.selected = Some(sel.min(last));
+            } else {
+                self.selected = None;
+            }
+        }
     }
     fn select_newer(&mut self) {
         if !self.is_empty() {
-            self.selected = (self.selected + 1) % self.len();
+            if let Some(sel) = self.selected {
+                self.selected = Some((sel + 1) % self.len());
+            } else {
+                let last = self.len().checked_sub(1);
+                self.selected = last;
+            }
         }
     }
     fn select_older(&mut self) {
         if !self.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.len().saturating_sub(1));
+            let last = self.len().checked_sub(1);
+            if let Some(sel) = self.selected {
+                self.selected = sel.checked_sub(1).or(last);
+            } else {
+                self.selected = last;
+            }
         }
     }
     fn select_end(&mut self) {
         if !self.is_empty() {
-            self.selected = self.len() - 1;
+            self.selected = self.len().checked_sub(1);
         }
     }
     fn focus_by_index(&mut self, idx: usize) {
@@ -767,12 +781,17 @@ impl TaskList {
         }
     }
     fn focus_by_selection(&mut self) {
-        self.focus_by_index(self.selected);
+        if let Some(sel) = self.selected {
+            self.focus_by_index(sel);
+        }
     }
     fn focus_by_wid(&mut self, wid: Window) {
         if let Some(idx) = self.tasks.iter().position(|task| task.wid == wid) {
             self.focus_by_index(idx);
         }
+    }
+    fn unfocus(&mut self) {
+        self.selected = None;
     }
 }
 
@@ -869,6 +888,11 @@ impl TextRenderer {
             line_height: conf.line_height,
         };
         self.layout.reset(&settings);
+
+        // fixme:
+        // a rasterized glyph might not match its computed layout:
+        // - layouts are all computed with a single font (index 0)
+        // - raster data uses the appropriate font instead
         self.layout
             .append(&self.fonts, &TextStyle::new(text, self.size, 0));
 
@@ -1516,7 +1540,7 @@ fn get_active_window(
     conn: &impl Connection,
     screen: &Screen,
     atoms: &AtomCollection,
-) -> Result<Window> {
+) -> Result<Option<Window>> {
     let prop = conn
         .get_property(
             false,
@@ -1527,11 +1551,12 @@ fn get_active_window(
             u32::MAX,
         )?
         .reply()?;
-    let wid = prop
-        .value32()
-        .ok_or("failed to extract active window")?
-        .collect::<Vec<_>>()[0];
-    Ok(wid)
+
+    Ok(prop.value32().and_then(|mut val| match val.next() {
+        None => None,
+        Some(0) => None,
+        Some(wid) => Some(wid),
+    }))
 }
 fn get_windows(
     conn: &impl Connection,
