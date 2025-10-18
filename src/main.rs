@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         icons.cache(conn, atoms, &tasks);
     }
     let mut geometry =
-        compute_window_geometry(conf, screen, tasks.len()).unwrap_or((0.0, 0.0, 1.0, 1.0).into());
+        compute_window_geometry(conf, screen, tasks.len()).unwrap_or(Area::new(0.0, 0.0, 1.0, 1.0));
     let this_window = create_window(conn, screen, atoms, geometry, depth, visual)?;
     let mut frame = Frame::new(geometry.w as u32, geometry.h as u32);
     let gc = create_graphic_context(conn, this_window)?;
@@ -715,7 +715,6 @@ impl TaskList {
         }
     }
     fn diff_update(&mut self, wids: Vec<Window>, conn: &impl Connection, atoms: &AtomCollection) {
-        // untrack windows not in wids
         let mut old_wids = Vec::with_capacity(self.len());
         self.tasks
             .iter()
@@ -723,7 +722,6 @@ impl TaskList {
             .for_each(|task| old_wids.push(task.wid));
         old_wids.into_iter().for_each(|wid| self.untrack(wid));
 
-        // track windows not in tasks
         let propmask = &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE);
         let mut new_wids = Vec::with_capacity(wids.len());
         wids.into_iter()
@@ -808,6 +806,9 @@ struct Area {
     h: f32,
 }
 impl Area {
+    fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
     fn shrink(mut self, amount: f32) -> Self {
         self.x += amount;
         self.y += amount;
@@ -1009,11 +1010,10 @@ impl Frame {
         let src = frame.buf_u32();
         let dst = self.buf_u32_mut();
 
-        // Iterate over source rows
         for sy in 0..src_height {
             let dy = y + sy as i32;
             if dy < 0 || dy >= dst_height as i32 {
-                continue; // skip out-of-bounds rows
+                continue;
             }
 
             let dst_row_start = dy as usize * dst_width;
@@ -1022,7 +1022,7 @@ impl Frame {
             for sx in 0..src_width {
                 let dx = x + sx as i32;
                 if dx < 0 || dx >= dst_width as i32 {
-                    continue; // skip out-of-bounds columns
+                    continue;
                 }
 
                 let dst_idx = dst_row_start + dx as usize;
@@ -1059,10 +1059,10 @@ impl Frame {
         let w = area.w;
         let h = area.h;
 
-        let l = Area::from((x, y, bw, h));
-        let t = Area::from((x, y, w, bw));
-        let d = Area::from((x, y + h - bw, w, bw));
-        let r = Area::from((x + w - bw, y, bw, h));
+        let l = Area::new(x, y, bw, h);
+        let t = Area::new(x, y, w, bw);
+        let d = Area::new(x, y + h - bw, w, bw);
+        let r = Area::new(x + w - bw, y, bw, h);
 
         self.draw_rect(l, color);
         self.draw_rect(t, color);
@@ -1073,28 +1073,18 @@ impl Frame {
         if width <= 0.0 {
             return;
         }
-        let area = Area::from((x1, y, x2 - x1, width));
+        let area = Area::new(x1, y, x2 - x1, width);
         self.draw_rect(area, color);
     }
     fn _draw_vline(&mut self, width: f32, x: f32, y1: f32, y2: f32, color: &Color) {
         if width <= 0.0 {
             return;
         }
-        let area = Area::from((x, y1, width, y2 - y1));
+        let area = Area::new(x, y1, width, y2 - y1);
         self.draw_rect(area, color);
     }
 }
 
-impl From<(f32, f32, f32, f32)> for Area {
-    fn from(value: (f32, f32, f32, f32)) -> Self {
-        Self {
-            x: value.0,
-            y: value.1,
-            w: value.2,
-            h: value.3,
-        }
-    }
-}
 type RasterizedGlyph = (Metrics, Vec<u8>);
 struct TextRenderer {
     ascii: [(Metrics, Vec<u8>); 256],
@@ -1227,7 +1217,7 @@ fn draw_list_rows(
     let (list, Some(selected_idx)) = tasks.list_descending() else {
         return;
     };
-    let mut area = Area::from((0.0, 0.0, frame.width() as f32, frame.height() as f32));
+    let mut area = Area::new(0.0, 0.0, frame.width() as f32, frame.height() as f32);
     frame.draw_rect(area, &conf.bg_color);
     frame.draw_rect_outline(area, conf.border_width, &conf.border_color);
     area = area.shrink(conf.border_width);
@@ -1255,12 +1245,12 @@ fn draw_list_rows(
         // left
         if conf.show_icons {
             let icon = icons.get(task);
-            let icon_area = (icon_x, y, icon_w, icon_w);
-            draw_icon(frame, conf, icon, icon_area.into());
+            let icon_area = Area::new(icon_x, y, icon_w, icon_w);
+            draw_icon(frame, conf, icon, icon_area);
         }
 
         // center
-        let task_area = Area::from((task_x, y, task_w, task_h));
+        let task_area = Area::new(task_x, y, task_w, task_h);
         if is_selected {
             draw_task(frame, conf, task, tr, &style, task_area);
         } else {
@@ -1280,7 +1270,7 @@ fn draw_list_rows(
 
         // right
         if conf.show_marker {
-            let marker_area = Area::from((marker_x, y, marker_w, task_h));
+            let marker_area = Area::new(marker_x, y, marker_w, task_h);
             // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
             if is_selected {
                 draw_marker(frame, conf, tr, marker_area);
@@ -1309,7 +1299,7 @@ fn draw_list_cols(
     let (list, Some(selected_idx)) = tasks.list_descending() else {
         return;
     };
-    let mut area = Area::from((0.0, 0.0, frame.width() as f32, frame.height() as f32));
+    let mut area = Area::new(0.0, 0.0, frame.width() as f32, frame.height() as f32);
     frame.draw_rect(area, &conf.bg_color);
     frame.draw_rect_outline(area, conf.border_width, &conf.border_color);
     area = area.shrink(conf.border_width);
@@ -1338,12 +1328,12 @@ fn draw_list_cols(
         // left
         if conf.show_icons {
             let icon = icons.get(task);
-            let icon_area = (x, icon_y, icon_h, icon_h);
-            draw_icon(frame, conf, icon, icon_area.into());
+            let icon_area = Area::new(x, icon_y, icon_h, icon_h);
+            draw_icon(frame, conf, icon, icon_area);
         }
 
         // center
-        let task_area = Area::from((x, task_y, task_w, task_h));
+        let task_area = Area::new(x, task_y, task_w, task_h);
         if is_selected {
             draw_task(frame, conf, task, tr, &style, task_area);
         } else {
@@ -1363,7 +1353,7 @@ fn draw_list_cols(
 
         // right
         if conf.show_marker {
-            let marker_area = Area::from((x, marker_y, task_h, marker_h));
+            let marker_area = Area::new(x, marker_y, task_h, marker_h);
             // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
             if is_selected {
                 draw_marker(frame, conf, tr, marker_area);
@@ -1973,7 +1963,7 @@ fn compute_window_geometry_row(conf: &Config, screen: &Screen, tasks: usize) -> 
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    Some((x, y, w, h).into())
+    Some(Area::new(x, y, w, h))
 }
 fn compute_window_geometry_col(conf: &Config, screen: &Screen, tasks: usize) -> Option<Area> {
     if tasks == 0 {
@@ -1989,7 +1979,7 @@ fn compute_window_geometry_col(conf: &Config, screen: &Screen, tasks: usize) -> 
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    Some((x, y, w, h).into())
+    Some(Area::new(x, y, w, h))
 }
 fn compute_task_size(conf: &Config, screen_size: f32, task_size: Size, tasks: usize) -> f32 {
     let bw = conf.border_width * 2.0;
