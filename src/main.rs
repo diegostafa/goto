@@ -11,8 +11,6 @@ use std::fmt::Display;
 use std::fs::read_to_string;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tiny_skia::{Color, FilterQuality, Pixmap, PixmapPaint};
-use tiny_skia::{IntSize, Transform};
 use x11rb::atom_manager;
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
@@ -34,14 +32,10 @@ macro_rules! log_time {
     }};
 }
 
-/*
-todo:
-- remove tiny_skia dependency
-*/
-
 // --- main
 const APP_NAME: &str = "goto";
 const HICOLOR: &str = "/usr/share/icons/hicolor";
+const INCH_TO_MM: f32 = 25.4;
 
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
@@ -70,7 +64,7 @@ fn main() -> Result<()> {
     let mut geometry =
         compute_window_geometry(conf, screen, tasks.len()).unwrap_or((0.0, 0.0, 1.0, 1.0).into());
     let this_window = create_window(conn, screen, atoms, geometry, depth, visual)?;
-    let mut pixmap = Pixmap::new(geometry.w as u32, geometry.h as u32).unwrap();
+    let mut frame = Frame::new(geometry.w as u32, geometry.h as u32);
     let gc = create_graphic_context(conn, this_window)?;
 
     let tr = &mut TextRenderer::new(conf);
@@ -203,15 +197,15 @@ fn main() -> Result<()> {
 
             geometry = g;
             request_window_move(conn, this_window, geometry)?;
-            pixmap = Pixmap::new(geometry.w as u32, geometry.h as u32).unwrap();
+            frame.resize(geometry.w as u32, geometry.h as u32);
             window_changed = true;
         }
         if is_mapped
             && !tasks.is_empty()
             && (focus_changed || title_changed || icons_changed || window_changed)
         {
-            draw_list(&mut pixmap, conf, &tasks, tr, icons);
-            send_window_pixmap(conn, this_window, gc, &pixmap, depth)?;
+            draw_list(&mut frame, conf, &tasks, tr, icons);
+            send_frame(conn, this_window, gc, &frame, depth)?;
         }
     }
 }
@@ -331,34 +325,34 @@ impl Config {
             show_marker: true,
             marker: '•',
             marker_width: Some(10.0),
-            marker_fg_color: Color::from_rgba8(255, 255, 255, 255),
-            marker_bg_color: Color::from_rgba8(0, 0, 0, 255),
+            marker_fg_color: Color::new(255, 255, 255, 255),
+            marker_bg_color: Color::new(0, 0, 0, 255),
             show_icons: true,
             icon_padding: Size::Relative(0.2),
             icon_border_width: 1.0,
-            icon_border_color: Color::from_rgba8(0, 0, 0, 255),
-            icon_bg_color: Color::from_rgba8(0, 0, 0, 255),
+            icon_border_color: Color::new(0, 0, 0, 255),
+            icon_bg_color: Color::new(0, 0, 0, 255),
             layout: ListLayout::Rows,
             location: WindowLocation::Center,
-            bg_color: Color::from_rgba8(0, 0, 0, 255),
-            border_color: Color::from_rgba8(64, 64, 64, 255),
+            bg_color: Color::new(0, 0, 0, 255),
+            border_color: Color::new(64, 64, 64, 255),
             border_width: 1.0,
             col_sep_width: 0.0,
-            col_sep_color: Color::from_rgba8(64, 64, 64, 255),
+            col_sep_color: Color::new(64, 64, 64, 255),
             row_sep_width: 0.0,
-            row_sep_color: Color::from_rgba8(64, 64, 64, 255),
+            row_sep_color: Color::new(64, 64, 64, 255),
             task_height: Size::Absolute(64),
             task_width: Size::Absolute(200),
             width: Size::Relative(0.4).resolve(screen.width_in_pixels as f32),
             height: Size::Relative(0.2).resolve(screen.width_in_pixels as f32),
-            task_bg_color: Color::from_rgba8(50, 50, 50, 255),
-            task_fg_color: Color::from_rgba8(255, 255, 255, 255),
-            task_border_color: Color::from_rgba8(200, 200, 200, 255),
+            task_bg_color: Color::new(50, 50, 50, 255),
+            task_fg_color: Color::new(255, 255, 255, 255),
+            task_border_color: Color::new(200, 200, 200, 255),
             task_border_width: 0.0,
             task_gradient: true,
-            selected_task_bg_color: Color::from_rgba8(92, 64, 64, 255),
-            selected_task_fg_color: Color::from_rgba8(255, 255, 255, 255),
-            selected_task_border_color: Color::from_rgba8(128, 64, 32, 255),
+            selected_task_bg_color: Color::new(92, 64, 64, 255),
+            selected_task_fg_color: Color::new(255, 255, 255, 255),
+            selected_task_border_color: Color::new(128, 64, 32, 255),
             selected_task_border_width: 4.0,
             key_quit: Keysym::Escape,
             key_next: Keysym::Tab,
@@ -386,7 +380,7 @@ impl Config {
         for (i, line) in file.lines().map(str::trim).enumerate() {
             macro_rules! warning {
                 ($e:expr) => {
-                    eprintln!("[WARNING] line {}, failed to parse `{line}`: {}", i + 1, $e)
+                    println!("[WARNING] line {}, failed to parse `{line}`: {}", i + 1, $e)
                 };
             }
             if line.is_empty() || line.starts_with('#') {
@@ -584,15 +578,25 @@ fn str_to_color(value: &str) -> Result<Color> {
         let r = u8::from_str_radix(&value[0..1].repeat(2), 16).map_err(|e| e.to_string())?;
         let g = u8::from_str_radix(&value[1..2].repeat(2), 16).map_err(|e| e.to_string())?;
         let b = u8::from_str_radix(&value[2..3].repeat(2), 16).map_err(|e| e.to_string())?;
-        return Ok(Color::from_rgba8(r, g, b, 255));
+        return Ok(Color::new(r, g, b, 255));
     }
     if value.len() == 6 {
         let r = u8::from_str_radix(&value[0..2], 16).map_err(|e| e.to_string())?;
         let g = u8::from_str_radix(&value[2..4], 16).map_err(|e| e.to_string())?;
         let b = u8::from_str_radix(&value[4..6], 16).map_err(|e| e.to_string())?;
-        return Ok(Color::from_rgba8(r, g, b, 255));
+        return Ok(Color::new(r, g, b, 255));
     }
-    Err(format!("invalid hex color `{value}`, provide an rgb RGB color").into())
+    if value.len() == 8 {
+        let r = u8::from_str_radix(&value[0..2], 16).map_err(|e| e.to_string())?;
+        let g = u8::from_str_radix(&value[2..4], 16).map_err(|e| e.to_string())?;
+        let b = u8::from_str_radix(&value[4..6], 16).map_err(|e| e.to_string())?;
+        let a = u8::from_str_radix(&value[6..8], 16).map_err(|e| e.to_string())?;
+        return Ok(Color::new(r, g, b, a));
+    }
+    Err(
+        format!("invalid hex color `{value}`, valid formats: `#rgb`, `#rrggbb`, `#rrggbbaa`")
+            .into(),
+    )
 }
 fn str_to_keysym(value: &str) -> Result<Keysym> {
     let value = value.trim();
@@ -796,7 +800,7 @@ impl TaskList {
 }
 
 // --- gui
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct Area {
     x: f32,
     y: f32,
@@ -812,6 +816,275 @@ impl Area {
         self
     }
 }
+#[derive(Clone, Copy)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+impl Color {
+    fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+    fn multiply(&self, factor: f32) -> Self {
+        Self {
+            r: (self.r as f32 * factor) as u8,
+            g: (self.g as f32 * factor) as u8,
+            b: (self.b as f32 * factor) as u8,
+            a: (self.a as f32 * factor) as u8,
+        }
+    }
+    fn _from_rgba(color: u32) -> Self {
+        Self {
+            r: ((color >> 0) & 0xFF) as u8,
+            g: ((color >> 8) & 0xFF) as u8,
+            b: ((color >> 16) & 0xFF) as u8,
+            a: ((color >> 24) & 0xFF) as u8,
+        }
+    }
+    fn to_bgra(self) -> u32 {
+        u32::from_ne_bytes([self.b, self.g, self.r, self.a])
+    }
+    fn _to_argb(self) -> u32 {
+        u32::from_ne_bytes([self.a, self.r, self.g, self.b])
+    }
+    fn _to_rgba(self) -> u32 {
+        u32::from_ne_bytes([self.r, self.g, self.b, self.a])
+    }
+}
+#[derive(Clone)]
+struct Frame {
+    buf: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+impl Frame {
+    const CHANNELS: u32 = 4;
+
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            buf: vec![0; (width * height * Self::CHANNELS) as usize],
+            width,
+            height,
+        }
+    }
+    fn from_rgba_u8(buf: &[u8], width: u32, height: u32) -> Self {
+        let mut frame = Self::new(width, height);
+        let frame_buf = frame.buf_u32_mut();
+        for (i, rgba) in buf.chunks(4).enumerate() {
+            frame_buf[i] = u32::from_ne_bytes([rgba[2], rgba[1], rgba[0], rgba[3]]);
+        }
+        frame
+    }
+    fn from_argb_u32(buf: &[u32], width: u32, height: u32) -> Self {
+        let mut frame = Self::new(width, height);
+        for (i, argb) in buf.iter().enumerate() {
+            frame.buf[i * 4 + 0] = ((*argb >> 0) & 0xFF) as u8;
+            frame.buf[i * 4 + 1] = ((*argb >> 8) & 0xFF) as u8;
+            frame.buf[i * 4 + 2] = ((*argb >> 16) & 0xFF) as u8;
+            frame.buf[i * 4 + 3] = ((*argb >> 24) & 0xFF) as u8;
+        }
+        frame
+    }
+    fn resize(&mut self, width: u32, height: u32) {
+        self.buf
+            .resize((width * height * Self::CHANNELS) as usize, 0);
+        self.width = width;
+        self.height = height;
+    }
+    fn _scale_nn(&self, factor: f32) -> Self {
+        let (src_width, src_height) = (self.width as usize, self.height as usize);
+        let src_buf = self.buf_u32();
+
+        let dst_width = (src_width as f32 * factor).round().max(1.0) as usize;
+        let dst_height = (src_height as f32 * factor).round().max(1.0) as usize;
+
+        let mut dst = Self::new(dst_width as u32, dst_height as u32);
+        let dst_buf = dst.buf_u32_mut();
+
+        for y in 0..dst_height {
+            let src_y = (((y as f32) / factor).floor() as usize).min(src_height - 1);
+            for x in 0..dst_width {
+                let src_x = (((x as f32) / factor).floor() as usize).min(src_width - 1);
+                dst_buf[y * dst_width + x] = src_buf[src_y * src_width + src_x];
+            }
+        }
+        dst
+    }
+    fn scale_bilinear(&self, factor: f32) -> Self {
+        let (src_width, src_height) = (self.width as usize, self.height as usize);
+        let src_buf = self.buf_u32();
+
+        let dst_width = (src_width as f32 * factor).round().max(1.0) as usize;
+        let dst_height = (src_height as f32 * factor).round().max(1.0) as usize;
+
+        let mut dst = Self::new(dst_width as u32, dst_height as u32);
+        let dst_buf = dst.buf_u32_mut();
+
+        let mut x_map = Vec::with_capacity(dst_width);
+        let mut y_map = Vec::with_capacity(dst_height);
+
+        for x in 0..dst_width {
+            let src_x = (x as f32) * ((src_width - 1) as f32) / ((dst_width - 1).max(1) as f32);
+            let x0 = src_x.floor() as usize;
+            let x1 = (x0 + 1).min(src_width - 1);
+            let dx = src_x - x0 as f32;
+            x_map.push((x0, x1, dx));
+        }
+
+        for y in 0..dst_height {
+            let src_y = (y as f32) * ((src_height - 1) as f32) / ((dst_height - 1).max(1) as f32);
+            let y0 = src_y.floor() as usize;
+            let y1 = (y0 + 1).min(src_height - 1);
+            let dy = src_y - y0 as f32;
+            y_map.push((y0, y1, dy));
+        }
+
+        for (y, &(y0, y1, dy)) in y_map.iter().enumerate() {
+            let row0 = &src_buf[y0 * src_width..(y0 + 1) * src_width];
+            let row1 = &src_buf[y1 * src_width..(y1 + 1) * src_width];
+
+            for (x, &(x0, x1, dx)) in x_map.iter().enumerate() {
+                let p00 = row0[x0];
+                let p10 = row0[x1];
+                let p01 = row1[x0];
+                let p11 = row1[x1];
+
+                let interp = |shift: u32| -> u32 {
+                    let c00 = ((p00 >> shift) & 0xFF) as f32;
+                    let c10 = ((p10 >> shift) & 0xFF) as f32;
+                    let c01 = ((p01 >> shift) & 0xFF) as f32;
+                    let c11 = ((p11 >> shift) & 0xFF) as f32;
+
+                    let c0 = c00 * (1.0 - dx) + c10 * dx;
+                    let c1 = c01 * (1.0 - dx) + c11 * dx;
+                    ((c0 * (1.0 - dy) + c1 * dy).round() as u32) & 0xFF
+                };
+
+                let b = interp(0);
+                let g = interp(8);
+                let r = interp(16);
+                let a = interp(24);
+
+                dst_buf[y * dst_width + x] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+        }
+        dst
+    }
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn buf_u8(&self) -> &[u8] {
+        &self.buf
+    }
+    fn buf_u32(&self) -> &[u32] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.buf.as_ptr() as *const u32,
+                (self.width * self.height) as usize,
+            )
+        }
+    }
+    fn _buf_u8_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+    fn buf_u32_mut(&mut self) -> &mut [u32] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buf.as_mut_ptr() as *mut u32,
+                (self.width * self.height) as usize,
+            )
+        }
+    }
+    fn blit_frame(&mut self, frame: &Frame, x: i32, y: i32) {
+        let dst_width = self.width as usize;
+        let dst_height = self.height as usize;
+        let src_width = frame.width as usize;
+        let src_height = frame.height as usize;
+
+        let src = frame.buf_u32();
+        let dst = self.buf_u32_mut();
+
+        // Iterate over source rows
+        for sy in 0..src_height {
+            let dy = y + sy as i32;
+            if dy < 0 || dy >= dst_height as i32 {
+                continue; // skip out-of-bounds rows
+            }
+
+            let dst_row_start = dy as usize * dst_width;
+            let src_row_start = sy * src_width;
+
+            for sx in 0..src_width {
+                let dx = x + sx as i32;
+                if dx < 0 || dx >= dst_width as i32 {
+                    continue; // skip out-of-bounds columns
+                }
+
+                let dst_idx = dst_row_start + dx as usize;
+                let src_idx = src_row_start + sx;
+
+                dst[dst_idx] = src[src_idx];
+            }
+        }
+    }
+    fn draw_rect(&mut self, area: Area, color: &Color) {
+        let color = color.to_bgra();
+
+        let x = area.x.floor() as u32;
+        let y = area.y.floor() as u32;
+        let w = area.w.ceil() as u32;
+        let h = area.h.ceil() as u32;
+
+        let width = self.width;
+        let buf = self.buf_u32_mut();
+
+        for row in y..y + h {
+            let start = (row * width + x) as usize;
+            let end = start + w as usize;
+            buf[start..end].fill(color);
+        }
+    }
+    fn draw_rect_outline(&mut self, area: Area, bw: f32, color: &Color) {
+        if bw <= 0.0 {
+            return;
+        }
+
+        let x = area.x;
+        let y = area.y;
+        let w = area.w;
+        let h = area.h;
+
+        let l = Area::from((x, y, bw, h));
+        let t = Area::from((x, y, w, bw));
+        let d = Area::from((x, y + h - bw, w, bw));
+        let r = Area::from((x + w - bw, y, bw, h));
+
+        self.draw_rect(l, color);
+        self.draw_rect(t, color);
+        self.draw_rect(r, color);
+        self.draw_rect(d, color);
+    }
+    fn draw_hline(&mut self, width: f32, y: f32, x1: f32, x2: f32, color: &Color) {
+        if width <= 0.0 {
+            return;
+        }
+        let area = Area::from((x1, y, x2 - x1, width));
+        self.draw_rect(area, color);
+    }
+    fn _draw_vline(&mut self, width: f32, x: f32, y1: f32, y2: f32, color: &Color) {
+        if width <= 0.0 {
+            return;
+        }
+        let area = Area::from((x, y1, width, y2 - y1));
+        self.draw_rect(area, color);
+    }
+}
+
 impl From<(f32, f32, f32, f32)> for Area {
     fn from(value: (f32, f32, f32, f32)) -> Self {
         Self {
@@ -892,7 +1165,7 @@ impl TextRenderer {
         // fixme:
         // a rasterized glyph might not match its computed layout:
         // - layouts are all computed with a single font (index 0)
-        // - raster data uses the appropriate font instead
+        // - the rasterized glyph is instead computed with the appropriate font
         self.layout
             .append(&self.fonts, &TextStyle::new(text, self.size, 0));
 
@@ -933,19 +1206,19 @@ impl TextRenderer {
     }
 }
 fn draw_list(
-    pm: &mut Pixmap,
+    frame: &mut Frame,
     conf: &Config,
     tasks: &TaskList,
     tr: &mut TextRenderer,
     icons: &mut IconCache,
 ) {
     match conf.layout {
-        ListLayout::Rows => draw_list_rows(pm, conf, tasks, tr, icons),
-        ListLayout::Columns => draw_list_cols(pm, conf, tasks, tr, icons),
+        ListLayout::Rows => draw_list_rows(frame, conf, tasks, tr, icons),
+        ListLayout::Columns => draw_list_cols(frame, conf, tasks, tr, icons),
     }
 }
 fn draw_list_rows(
-    pm: &mut Pixmap,
+    frame: &mut Frame,
     conf: &Config,
     tasks: &TaskList,
     tr: &mut TextRenderer,
@@ -954,9 +1227,9 @@ fn draw_list_rows(
     let (list, Some(selected_idx)) = tasks.list_descending() else {
         return;
     };
-    let mut area = Area::from((0.0, 0.0, pm.width() as f32, pm.height() as f32));
-    draw_rect(pm, &conf.bg_color, area);
-    draw_rect_outline(pm, conf.border_width, &conf.border_color, area);
+    let mut area = Area::from((0.0, 0.0, frame.width() as f32, frame.height() as f32));
+    frame.draw_rect(area, &conf.bg_color);
+    frame.draw_rect_outline(area, conf.border_width, &conf.border_color);
     area = area.shrink(conf.border_width);
 
     let task_h = area.h / tasks.len() as f32;
@@ -983,26 +1256,26 @@ fn draw_list_rows(
         if conf.show_icons {
             let icon = icons.get(task);
             let icon_area = (icon_x, y, icon_w, icon_w);
-            draw_icon(pm, conf, icon, icon_area.into());
+            draw_icon(frame, conf, icon, icon_area.into());
         }
 
         // center
         let task_area = Area::from((task_x, y, task_w, task_h));
         if is_selected {
-            draw_task(pm, conf, task, tr, &style, task_area);
+            draw_task(frame, conf, task, tr, &style, task_area);
         } else {
             let mut style = conf.task_style();
             let step = 1.0 - (i as f32 / tasks.len() as f32);
-            let gradient = Color::from_rgba8(
-                (step * 255.0 * style.bg_color.red()) as u8,
-                (step * 255.0 * style.bg_color.green()) as u8,
-                (step * 255.0 * style.bg_color.blue()) as u8,
-                (step * 255.0 * style.bg_color.alpha()) as u8,
+            let gradient = Color::new(
+                (step * style.bg_color.r as f32) as u8,
+                (step * style.bg_color.g as f32) as u8,
+                (step * style.bg_color.b as f32) as u8,
+                (step * style.bg_color.a as f32) as u8,
             );
             if conf.task_gradient {
                 style.bg_color = &gradient;
             }
-            draw_task(pm, conf, task, tr, &style, task_area);
+            draw_task(frame, conf, task, tr, &style, task_area);
         };
 
         // right
@@ -1010,25 +1283,24 @@ fn draw_list_rows(
             let marker_area = Area::from((marker_x, y, marker_w, task_h));
             // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
             if is_selected {
-                draw_marker(pm, conf, tr, marker_area);
+                draw_marker(frame, conf, tr, marker_area);
             }
         }
 
         // row separator
         if i != 0 {
-            draw_hline(
-                pm,
-                &conf.row_sep_color,
+            frame.draw_hline(
                 conf.row_sep_width,
                 y,
                 area.x,
                 area.x + area.w,
+                &conf.row_sep_color,
             );
         }
     }
 }
 fn draw_list_cols(
-    pm: &mut Pixmap,
+    frame: &mut Frame,
     conf: &Config,
     tasks: &TaskList,
     tr: &mut TextRenderer,
@@ -1037,9 +1309,9 @@ fn draw_list_cols(
     let (list, Some(selected_idx)) = tasks.list_descending() else {
         return;
     };
-    let mut area = Area::from((0.0, 0.0, pm.width() as f32, pm.height() as f32));
-    draw_rect(pm, &conf.bg_color, area);
-    draw_rect_outline(pm, conf.border_width, &conf.border_color, area);
+    let mut area = Area::from((0.0, 0.0, frame.width() as f32, frame.height() as f32));
+    frame.draw_rect(area, &conf.bg_color);
+    frame.draw_rect_outline(area, conf.border_width, &conf.border_color);
     area = area.shrink(conf.border_width);
 
     let task_w = area.w / tasks.len() as f32;
@@ -1067,26 +1339,26 @@ fn draw_list_cols(
         if conf.show_icons {
             let icon = icons.get(task);
             let icon_area = (x, icon_y, icon_h, icon_h);
-            draw_icon(pm, conf, icon, icon_area.into());
+            draw_icon(frame, conf, icon, icon_area.into());
         }
 
         // center
         let task_area = Area::from((x, task_y, task_w, task_h));
         if is_selected {
-            draw_task(pm, conf, task, tr, &style, task_area);
+            draw_task(frame, conf, task, tr, &style, task_area);
         } else {
             let mut style = conf.task_style();
             let step = 1.0 - (i as f32 / tasks.len() as f32);
-            let gradient = Color::from_rgba8(
-                (step * 255.0 * style.bg_color.red()) as u8,
-                (step * 255.0 * style.bg_color.green()) as u8,
-                (step * 255.0 * style.bg_color.blue()) as u8,
-                (step * 255.0 * style.bg_color.alpha()) as u8,
+            let gradient = Color::new(
+                (step * style.bg_color.r as f32) as u8,
+                (step * style.bg_color.g as f32) as u8,
+                (step * style.bg_color.b as f32) as u8,
+                (step * style.bg_color.a as f32) as u8,
             );
             if conf.task_gradient {
                 style.bg_color = &gradient;
             }
-            draw_task(pm, conf, task, tr, &style, task_area);
+            draw_task(frame, conf, task, tr, &style, task_area);
         };
 
         // right
@@ -1094,7 +1366,7 @@ fn draw_list_cols(
             let marker_area = Area::from((x, marker_y, task_h, marker_h));
             // draw_rect(pm, &conf.marker_bg_color, marker_area.into());
             if is_selected {
-                draw_marker(pm, conf, tr, marker_area);
+                draw_marker(frame, conf, tr, marker_area);
             }
         }
 
@@ -1111,132 +1383,62 @@ fn draw_list_cols(
         // }
     }
 }
-fn draw_marker(pm: &mut Pixmap, conf: &Config, tr: &mut TextRenderer, area: Area) {
+fn draw_marker(frame: &mut Frame, conf: &Config, tr: &mut TextRenderer, area: Area) {
     let mut buf = [0u8; 4];
     let marker_str = conf.marker.encode_utf8(&mut buf);
     tr.set_layout(marker_str, conf, area);
-    draw_rect(pm, &conf.marker_bg_color, area);
-    draw_text(pm, &conf.marker_fg_color, tr);
+    frame.draw_rect(area, &conf.marker_bg_color);
+    draw_text(frame, &conf.marker_fg_color, tr);
 }
-fn draw_icon(pm: &mut Pixmap, conf: &Config, icon: &Pixmap, mut area: Area) {
-    draw_rect(pm, &conf.icon_bg_color, area);
-    draw_rect_outline(pm, conf.icon_border_width, &conf.icon_border_color, area);
-    area.shrink(conf.icon_border_width);
-    let padding = conf.icon_padding.resolve(area.h);
-    area = area.shrink(padding);
-    let scale = area.w / (icon.width().max(icon.height()) as f32);
-    let trans = Transform::identity()
-        .post_scale(scale, scale)
-        .post_translate(area.x, area.y);
-    let paint = PixmapPaint {
-        quality: FilterQuality::Bilinear,
-        ..Default::default()
-    };
-    pm.draw_pixmap(0, 0, icon.as_ref(), &paint, trans, None);
+fn draw_icon(frame: &mut Frame, conf: &Config, icon: &Frame, mut area: Area) {
+    frame.draw_rect(area, &conf.icon_bg_color);
+    frame.draw_rect_outline(area, conf.icon_border_width, &conf.icon_border_color);
+
+    area = area.shrink(conf.icon_border_width);
+    area = area.shrink(conf.icon_padding.resolve(area.h));
+
+    let factor = area.w / (icon.width().max(icon.height()) as f32);
+    let scaled = icon.scale_bilinear(factor);
+    frame.blit_frame(&scaled, area.x as i32, area.y as i32);
 }
 fn draw_task(
-    pm: &mut Pixmap,
+    frame: &mut Frame,
     conf: &Config,
     task: &Task,
     tr: &mut TextRenderer,
     style: &TaskStyle,
     area: Area,
 ) {
-    draw_rect(pm, style.bg_color, area);
-    draw_rect_outline(pm, style.border_width, style.border_color, area);
+    frame.draw_rect(area, style.bg_color);
+    frame.draw_rect_outline(area, style.border_width, style.border_color);
 
     let bw = conf.task_border_width.max(conf.selected_task_border_width);
     tr.set_layout(&task.title, conf, area.shrink(bw));
-    draw_text(pm, style.fg_color, tr);
+    draw_text(frame, style.fg_color, tr);
 }
-fn draw_text(pm: &mut Pixmap, color: &Color, tr: &TextRenderer) {
-    let p_stride = 4; // bgra
-    let b_stride = 1; // grayscale
-    let pixmap_width = pm.width() as usize;
-    let pixmap = pm.data_mut();
+fn draw_text(frame: &mut Frame, color: &Color, tr: &TextRenderer) {
+    let frame_width = frame.width() as usize;
+    let frame = frame.buf_u32_mut();
 
     for glyph_pos in tr.layout.glyphs() {
         let (metrics, bitmap) = tr.get(glyph_pos.parent);
         for row in 0..metrics.height {
             for col in 0..metrics.width {
-                let b_offset = (row * metrics.width + col) * b_stride;
-                let a = bitmap[b_offset + 0] as f32;
+                let b_offset = row * metrics.width + col;
+                let a = bitmap[b_offset] as f32 / 255.0;
                 if a == 0.0 {
                     continue;
                 }
                 let px = (glyph_pos.x as usize) + col;
                 let py = (glyph_pos.y as usize) + row;
-                let p_offset = (py * pixmap_width + px) * p_stride;
-                if p_offset >= pixmap.len() {
+                let p_offset = py * frame_width + px;
+                if p_offset >= frame.len() {
                     continue;
                 }
-                pixmap[p_offset + 0] = (a * color.blue()) as u8;
-                pixmap[p_offset + 1] = (a * color.green()) as u8;
-                pixmap[p_offset + 2] = (a * color.red()) as u8;
+                frame[p_offset] = color.multiply(a).to_bgra();
             }
         }
     }
-}
-fn draw_rect_outline(pm: &mut Pixmap, bw: f32, color: &Color, area: Area) {
-    if bw <= 0.0 {
-        return;
-    }
-
-    let x = area.x;
-    let y = area.y;
-    let w = area.w;
-    let h = area.h;
-
-    let l = Area::from((x, y, bw, h));
-    let t = Area::from((x, y, w, bw));
-    let d = Area::from((x, y + h - bw, w, bw));
-    let r = Area::from((x + w - bw, y, bw, h));
-
-    draw_rect(pm, color, l);
-    draw_rect(pm, color, t);
-    draw_rect(pm, color, r);
-    draw_rect(pm, color, d);
-}
-fn draw_rect(pm: &mut Pixmap, color: &Color, area: Area) {
-    let r = (color.red() * 255.0) as u8;
-    let g = (color.green() * 255.0) as u8;
-    let b = (color.blue() * 255.0) as u8;
-    let a = (color.alpha() * 255.0) as u8;
-    let c = (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | (b as u32);
-
-    let x = area.x.floor() as u32;
-    let y = area.y.floor() as u32;
-    let w = area.w.ceil() as u32;
-    let h = area.h.ceil() as u32;
-
-    let width = pm.width();
-    let height = pm.height();
-    let buf: &mut [u32] = unsafe {
-        std::slice::from_raw_parts_mut(
-            pm.data_mut().as_mut_ptr() as *mut u32,
-            (width * height) as usize,
-        )
-    };
-
-    for row in y..y + h {
-        let start = (row * width + x) as usize;
-        let end = start + w as usize;
-        buf[start..end].fill(c);
-    }
-}
-fn draw_hline(pm: &mut Pixmap, color: &Color, width: f32, y: f32, x1: f32, x2: f32) {
-    if width <= 0.0 {
-        return;
-    }
-    let ln = Area::from((x1, y, x2 - x1, width));
-    draw_rect(pm, color, ln);
-}
-fn _draw_vline(pm: &mut Pixmap, color: &Color, width: f32, x: f32, y1: f32, y2: f32) {
-    if width <= 0.0 {
-        return;
-    }
-    let ln = Area::from((x, y1, width, y2 - y1));
-    draw_rect(pm, color, ln);
 }
 
 // --- x11
@@ -1335,7 +1537,7 @@ impl Keys {
     }
 }
 struct IconCache {
-    icons: HashMap<(String, String), Pixmap>,
+    icons: HashMap<(String, String), Frame>,
 }
 impl IconCache {
     fn new() -> Self {
@@ -1359,8 +1561,7 @@ impl IconCache {
             self.icons.insert(task.class.clone(), icon.clone());
             return;
         }
-        self.icons
-            .insert(task.class.clone(), Pixmap::new(1, 1).unwrap());
+        self.icons.insert(task.class.clone(), Frame::new(0, 0));
     }
     fn cache(&mut self, conn: &impl Connection, atoms: &AtomCollection, tasks: &TaskList) {
         for task in tasks.list_ascending().0 {
@@ -1369,7 +1570,7 @@ impl IconCache {
             }
         }
     }
-    fn get(&mut self, task: &Task) -> &Pixmap {
+    fn get(&mut self, task: &Task) -> &Frame {
         self.icons.get(&task.class).unwrap()
     }
 }
@@ -1439,18 +1640,17 @@ fn create_window(
 
     Ok(window)
 }
-fn send_window_pixmap(
+fn send_frame(
     conn: &impl Connection,
     wid: Window,
     gc: Gcontext,
-    pixmap: &Pixmap,
+    frame: &Frame,
     depth: u8,
 ) -> Result<()> {
     let format = ImageFormat::Z_PIXMAP;
-    let w = pixmap.width() as u16;
-    let h = pixmap.height() as u16;
-    let data = pixmap.data();
-    conn.put_image(format, wid, gc, w, h, 0, 0, 0, depth, data)?;
+    let w = frame.width() as u16;
+    let h = frame.height() as u16;
+    conn.put_image(format, wid, gc, w, h, 0, 0, 0, depth, frame.buf_u8())?;
     Ok(())
 }
 fn request_window_close(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Result<()> {
@@ -1647,7 +1847,7 @@ fn _get_window_pid(
     let mut pids = reply.value32().ok_or_else(|| "no pid".to_string())?;
     Ok(pids.next())
 }
-fn get_net_wm_icon(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Result<Pixmap> {
+fn get_net_wm_icon(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Result<Frame> {
     let reply = conn
         .get_property(false, wid, atoms._NET_WM_ICON, atoms.CARDINAL, 0, u32::MAX)?
         .reply()?;
@@ -1681,15 +1881,15 @@ fn get_net_wm_icon(conn: &impl Connection, atoms: &AtomCollection, wid: Window) 
         bytes = &bytes[step..];
     }
     if let Some((w, h, data)) = biggest {
-        let icon = net_wm_icon_to_pixmap(w, h, data);
+        let icon = Frame::from_argb_u32(data, w as u32, h as u32);
         return Ok(icon);
     }
     Err("no _net_wm_icon".into())
 }
-fn get_hicolor_icon(task: &Task) -> Result<Pixmap> {
+fn get_hicolor_icon(task: &Task) -> Result<Frame> {
     let hicolor = PathBuf::from(HICOLOR);
     let search_term = task.class.1.to_lowercase();
-    let mut biggest: Option<Pixmap> = None;
+    let mut biggest: Option<Frame> = None;
     let files = visit_dir(hicolor)?;
     for file in files {
         let Some(filename) = file.file_name().map(|f| f.to_string_lossy()) else {
@@ -1697,71 +1897,48 @@ fn get_hicolor_icon(task: &Task) -> Result<Pixmap> {
         };
         if filename.to_lowercase().contains(&search_term) {
             let ext = file.extension().and_then(|s| s.to_str());
-
-            let pm = if ext == Some("png") {
-                let Ok(pm) = Pixmap::load_png(file) else {
-                    continue;
-                };
-                pm
+            let img = if ext == Some("png") {
+                //let Ok(pm) = Pixmap::load_png(file) else {
+                //    continue;
+                //};
+                //pm
+                continue;
             } else if ext == Some("svg") {
                 let svg = nsvg::parse_file(&file, nsvg::Units::Pixel, 96.0).unwrap();
                 let Ok(image) = svg.rasterize(1.0) else {
                     continue;
                 };
                 let (w, h) = (image.width(), image.height());
-                Pixmap::from_vec(image.into_vec(), IntSize::from_wh(w, h).unwrap()).unwrap()
+                Frame::from_rgba_u8(&image, w, h)
             } else {
                 continue;
             };
 
             match &biggest {
                 Some(icon) => {
-                    if pm.width() * pm.height() > icon.width() * icon.height() {
-                        biggest = Some(pm);
+                    if img.width() * img.height() > icon.width() * icon.height() {
+                        biggest = Some(img);
                     }
                 }
                 None => {
-                    biggest = Some(pm);
+                    biggest = Some(img);
                 }
             }
         }
     }
-
-    if let Some(mut icon) = biggest {
-        pixmap_swap_r_b(&mut icon);
+    if let Some(icon) = biggest {
         return Ok(icon);
     }
     Err("no hicolor icon".into())
-}
-fn pixmap_swap_r_b(pm: &mut Pixmap) {
-    for px in pm.data_mut().chunks_exact_mut(4) {
-        px.swap(2, 0);
-    }
 }
 fn get_dpi(db: &Database, screen: &Screen) -> Result<f32> {
     if let Ok(Some(dpi)) = db.get_value("Xft.dpi", "") {
         return Ok(dpi);
     }
-    let inch_to_mm = 25.4;
-    let dpi_x = screen.width_in_pixels as f32 * inch_to_mm / screen.width_in_millimeters as f32;
-    let dpi_y = screen.height_in_pixels as f32 * inch_to_mm / screen.height_in_millimeters as f32;
+    let dpi_x = screen.width_in_pixels as f32 * INCH_TO_MM / screen.width_in_millimeters as f32;
+    let dpi_y = screen.height_in_pixels as f32 * INCH_TO_MM / screen.height_in_millimeters as f32;
     let dpi = (dpi_x + dpi_y) / 2.0;
     Ok(dpi)
-}
-fn net_wm_icon_to_pixmap(w: usize, h: usize, data: &[u32]) -> Pixmap {
-    let mut pm = Pixmap::new(w as u32, h as u32).unwrap();
-    let pixmap = pm.data_mut();
-    for i in 0..w * h {
-        let a = ((data[i] >> 24) & 0xFF) as u8;
-        let r = ((data[i] >> 16) & 0xFF) as u8;
-        let g = ((data[i] >> 8) & 0xFF) as u8;
-        let b = ((data[i] >> 0) & 0xFF) as u8;
-        pixmap[i * 4 + 0] = b;
-        pixmap[i * 4 + 1] = g;
-        pixmap[i * 4 + 2] = r;
-        pixmap[i * 4 + 3] = a;
-    }
-    pm
 }
 fn window_to_task(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Option<Task> {
     let attr = conn.get_window_attributes(wid).ok()?.reply().ok()?;
