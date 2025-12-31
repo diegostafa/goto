@@ -1,25 +1,40 @@
 // #![allow(unused)]
 #![allow(clippy::identity_op)]
 
-use fontdue::layout::{
-    CoordinateSystem, HorizontalAlign, Layout, LayoutSettings, TextStyle, VerticalAlign, WrapStyle,
-};
-use fontdue::{Font, FontSettings, Metrics};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
 use std::fs::read_to_string;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+use fontdue::Font;
+use fontdue::FontSettings;
+use fontdue::Metrics;
+use fontdue::layout::CoordinateSystem;
+use fontdue::layout::HorizontalAlign;
+use fontdue::layout::Layout;
+use fontdue::layout::LayoutSettings;
+use fontdue::layout::TextStyle;
+use fontdue::layout::VerticalAlign;
+use fontdue::layout::WrapStyle;
 use x11rb::atom_manager;
 use x11rb::connection::Connection;
-use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
-use x11rb::protocol::xinput::{DeviceId, XIEventMask};
-use x11rb::protocol::xproto::{ConnectionExt as _, *};
-use x11rb::protocol::{Event, xinput};
+use x11rb::connection::RequestConnection;
+use x11rb::protocol::Event;
+use x11rb::protocol::render::ConnectionExt as _;
+use x11rb::protocol::render::PictType;
+use x11rb::protocol::render::{self};
+use x11rb::protocol::xinput;
+use x11rb::protocol::xinput::DeviceId;
+use x11rb::protocol::xinput::XIEventMask;
+use x11rb::protocol::xproto::ConnectionExt as _;
+use x11rb::protocol::xproto::*;
 use x11rb::resource_manager::Database;
+use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt;
-use xkbcommon::xkb::{Keysym, keysym_from_name};
+use xkbcommon::xkb::Keysym;
+use xkbcommon::xkb::keysym_from_name;
 
 #[allow(unused)]
 macro_rules! log_time {
@@ -37,6 +52,8 @@ const APP_NAME: &str = "goto";
 const HICOLOR: &str = "/usr/share/icons/hicolor";
 const INCH_TO_MM: f32 = 25.4;
 
+type Atoms = AtomCollection;
+type Conn = RustConnection;
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
 fn main() -> Result<()> {
@@ -50,7 +67,7 @@ fn main() -> Result<()> {
     let (depth, visual) = choose_visual(conn, *screen_num)?;
     let atoms = &AtomCollection::new(conn)?.reply()?;
     let conf = &Config::new(screen, &res_db);
-    let kb = Keys::init(conn, screen, conf)?;
+    let kb = Keymap::init(conn, screen, conf)?;
     let mut tasks = TaskList::new();
     let wids = get_windows(conn, screen, atoms).unwrap_or_default();
     tasks.diff_update(wids, conn, atoms);
@@ -59,7 +76,7 @@ fn main() -> Result<()> {
     }
     let icons = &mut IconCache::new();
     if conf.show_icons {
-        icons.cache(conn, atoms, &tasks);
+        icons.set_icons(conn, atoms, &tasks);
     }
     let mut geometry =
         compute_window_geometry(conf, screen, tasks.len()).unwrap_or(Area::new(0.0, 0.0, 1.0, 1.0));
@@ -118,7 +135,7 @@ fn main() -> Result<()> {
                             size_changed |= before_len != tasks.len();
                             focus_changed |= true;
                             if conf.show_icons {
-                                icons.cache(conn, atoms, &tasks);
+                                icons.set_icons(conn, atoms, &tasks);
                                 icons_changed |= true;
                             }
                         }
@@ -143,7 +160,7 @@ fn main() -> Result<()> {
                         && conf.show_icons
                         && let Some(task) = tasks.get_task_by_id(e.window)
                     {
-                        icons.refresh(conn, atoms, task);
+                        icons.set_icon(conn, atoms, task);
                         icons_changed |= true;
                     }
                 }
@@ -229,37 +246,34 @@ impl Size {
         }
     }
 }
-#[derive(Debug)]
-enum WindowLocation {
-    NorthWest,
-    North,
-    NorthEast,
-    West,
-    Center,
-    East,
-    SouthWest,
-    South,
-    SouthEast,
+
+pub struct Anchor {
+    x: f32,
+    y: f32,
 }
-impl WindowLocation {
-    fn resolve(&self, (aw, ah): (f32, f32), (bw, bh): (f32, f32)) -> (f32, f32) {
-        let half_aw = aw / 2.0;
-        let half_ah = ah / 2.0;
-        let half_bw = bw / 2.0;
-        let half_bh = bh / 2.0;
-        match self {
-            WindowLocation::NorthWest => (0.0, 0.0),
-            WindowLocation::North => (half_bw - half_aw, 0.0),
-            WindowLocation::NorthEast => (bw - aw, 0.0),
-            WindowLocation::West => (0.0, half_bh - ah),
-            WindowLocation::Center => (half_bw - half_aw, half_bh - half_ah),
-            WindowLocation::East => (bw - aw, half_bh - ah),
-            WindowLocation::SouthWest => (0.0, bh - ah),
-            WindowLocation::South => (half_bw - half_aw, bh - ah),
-            WindowLocation::SouthEast => (bw - aw, bh - ah),
-        }
+impl Anchor {
+    pub const TOP_LEFT: Self = Self::new(0.0, 0.0);
+    pub const TOP_CENTER: Self = Self::new(0.5, 0.0);
+    pub const TOP_RIGHT: Self = Self::new(1.0, 0.0);
+    pub const LEFT: Self = Self::new(0.0, 0.5);
+    pub const CENTER: Self = Self::new(0.5, 0.5);
+    pub const RIGHT: Self = Self::new(1.0, 0.5);
+    pub const BOTTOM_LEFT: Self = Self::new(0.0, 1.0);
+    pub const BOTTOM_CENTER: Self = Self::new(0.5, 1.0);
+    pub const BOTTOM_RIGHT: Self = Self::new(1.0, 1.0);
+
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+    pub fn align(&self, pos: (f32, f32), size: (f32, f32)) -> (f32, f32) {
+        let x = pos.0;
+        let y = pos.1;
+        let w = size.0;
+        let h = size.1;
+        (x - w * self.x, y - h * self.y)
     }
 }
+
 struct TaskStyle<'a> {
     bg_color: &'a Color,
     fg_color: &'a Color,
@@ -285,7 +299,7 @@ struct Config {
     icon_border_color: Color,
     icon_bg_color: Color,
     layout: ListLayout,
-    location: WindowLocation,
+    anchor: Anchor,
     bg_color: Color,
     border_color: Color,
     border_width: f32,
@@ -333,7 +347,7 @@ impl Config {
             icon_border_color: Color::new(0, 0, 0, 255),
             icon_bg_color: Color::new(0, 0, 0, 255),
             layout: ListLayout::Rows,
-            location: WindowLocation::Center,
+            anchor: Anchor::CENTER,
             bg_color: Color::new(0, 0, 0, 255),
             border_color: Color::new(64, 64, 64, 255),
             border_width: 1.0,
@@ -436,7 +450,7 @@ impl Config {
                 "icon_border_color" => parse_assign!(str_to_color, icon_border_color),
                 "icon_bg_color" => parse_assign!(str_to_color, icon_bg_color),
                 "layout" => parse_assign!(str_to_list_layout, layout),
-                "location" => parse_assign!(str_to_position, location),
+                "location" => parse_assign!(str_to_position, anchor),
                 "bg_color" => parse_assign!(str_to_color, bg_color),
                 "border_color" => parse_assign!(str_to_color, border_color),
                 "border_width" => parse_assign!(str_to_primitive, border_width),
@@ -544,21 +558,21 @@ fn str_to_size(value: &str) -> Result<Size> {
         Err(e) => Err(e.into()),
     }
 }
-fn str_to_position(value: &str) -> Result<WindowLocation> {
+fn str_to_position(value: &str) -> Result<Anchor> {
     let value = value.trim();
     if value.is_empty() {
         return Err("missing value".into());
     }
     match value.to_lowercase().as_str() {
-        "1" => Ok(WindowLocation::NorthWest),
-        "2" => Ok(WindowLocation::North),
-        "3" => Ok(WindowLocation::NorthEast),
-        "4" => Ok(WindowLocation::West),
-        "5" => Ok(WindowLocation::Center),
-        "6" => Ok(WindowLocation::East),
-        "7" => Ok(WindowLocation::SouthWest),
-        "8" => Ok(WindowLocation::South),
-        "9" => Ok(WindowLocation::SouthEast),
+        "1" => Ok(Anchor::TOP_LEFT),
+        "2" => Ok(Anchor::TOP_CENTER),
+        "3" => Ok(Anchor::TOP_RIGHT),
+        "4" => Ok(Anchor::LEFT),
+        "5" => Ok(Anchor::CENTER),
+        "6" => Ok(Anchor::RIGHT),
+        "7" => Ok(Anchor::BOTTOM_LEFT),
+        "8" => Ok(Anchor::BOTTOM_CENTER),
+        "9" => Ok(Anchor::BOTTOM_RIGHT),
         _ => Err(format!(
             "invalid location `{value}`, expected a value between 1 (top left) and 9 (bottom right)"
         )
@@ -714,7 +728,7 @@ impl TaskList {
             task.title = title;
         }
     }
-    fn diff_update(&mut self, wids: Vec<Window>, conn: &impl Connection, atoms: &AtomCollection) {
+    fn diff_update(&mut self, wids: Vec<Window>, conn: &Conn, atoms: &Atoms) {
         let mut old_wids = Vec::with_capacity(self.len());
         self.tasks
             .iter()
@@ -914,6 +928,10 @@ impl Frame {
         dst
     }
     fn scale_bilinear(&self, factor: f32) -> Self {
+        if self.buf.is_empty() {
+            return Self::new(0, 0);
+        }
+
         let (src_width, src_height) = (self.width as usize, self.height as usize);
         let src_buf = self.buf_u32();
 
@@ -1457,7 +1475,7 @@ atom_manager! {
         _NET_WM_WINDOW_TYPE_DIALOG,
     }
 }
-struct Keys {
+struct Keymap {
     key_next: Keycode,
     key_prev: Keycode,
     key_kill: Keycode,
@@ -1465,8 +1483,8 @@ struct Keys {
     key_mod: Keycode,
     modifier: ModMask,
 }
-impl Keys {
-    fn init(conn: &impl Connection, screen: &Screen, conf: &Config) -> Result<Self> {
+impl Keymap {
+    fn init(conn: &Conn, screen: &Screen, conf: &Config) -> Result<Self> {
         let setup = conn.setup();
         let min_keycode = setup.min_keycode;
         let max_keycode = setup.max_keycode;
@@ -1535,7 +1553,7 @@ impl IconCache {
             icons: HashMap::new(),
         }
     }
-    fn refresh(&mut self, conn: &impl Connection, atoms: &AtomCollection, task: &Task) {
+    fn set_icon(&mut self, conn: &Conn, atoms: &Atoms, task: &Task) {
         if let Ok(icon) = get_net_wm_icon(conn, atoms, task.wid) {
             self.icons.insert(task.class.clone(), icon);
             return;
@@ -1553,10 +1571,10 @@ impl IconCache {
         }
         self.icons.insert(task.class.clone(), Frame::new(0, 0));
     }
-    fn cache(&mut self, conn: &impl Connection, atoms: &AtomCollection, tasks: &TaskList) {
+    fn set_icons(&mut self, conn: &Conn, atoms: &Atoms, tasks: &TaskList) {
         for task in tasks.list_ascending().0 {
             if !self.icons.contains_key(&task.class) {
-                self.refresh(conn, atoms, task);
+                self.set_icon(conn, atoms, task);
             }
         }
     }
@@ -1565,9 +1583,9 @@ impl IconCache {
     }
 }
 fn create_window(
-    conn: &impl Connection,
+    conn: &Conn,
     screen: &Screen,
-    atoms: &AtomCollection,
+    atoms: &Atoms,
     geometry: Area,
     depth: u8,
     visual: Visualid,
@@ -1630,20 +1648,14 @@ fn create_window(
 
     Ok(window)
 }
-fn send_frame(
-    conn: &impl Connection,
-    wid: Window,
-    gc: Gcontext,
-    frame: &Frame,
-    depth: u8,
-) -> Result<()> {
+fn send_frame(conn: &Conn, wid: Window, gc: Gcontext, frame: &Frame, depth: u8) -> Result<()> {
     let format = ImageFormat::Z_PIXMAP;
     let w = frame.width() as u16;
     let h = frame.height() as u16;
     conn.put_image(format, wid, gc, w, h, 0, 0, 0, depth, frame.buf_u8())?;
     Ok(())
 }
-fn request_window_close(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Result<()> {
+fn request_window_close(conn: &Conn, atoms: &Atoms, wid: Window) -> Result<()> {
     let ev = ClientMessageEvent {
         response_type: CLIENT_MESSAGE_EVENT,
         format: 32,
@@ -1655,12 +1667,7 @@ fn request_window_close(conn: &impl Connection, atoms: &AtomCollection, wid: Win
     conn.send_event(false, wid, EventMask::NO_EVENT, ev)?;
     Ok(())
 }
-fn request_window_focus(
-    conn: &impl Connection,
-    screen: &Screen,
-    atoms: &AtomCollection,
-    wid: Window,
-) -> Result<()> {
+fn request_window_focus(conn: &Conn, screen: &Screen, atoms: &Atoms, wid: Window) -> Result<()> {
     conn.send_event(
         false,
         screen.root,
@@ -1676,7 +1683,7 @@ fn request_window_focus(
     )?;
     Ok(())
 }
-fn request_window_move(conn: &impl Connection, wid: Window, area: Area) -> Result<()> {
+fn request_window_move(conn: &Conn, wid: Window, area: Area) -> Result<()> {
     conn.configure_window(
         wid,
         &ConfigureWindowAux::new()
@@ -1687,12 +1694,12 @@ fn request_window_move(conn: &impl Connection, wid: Window, area: Area) -> Resul
     )?;
     Ok(())
 }
-fn create_graphic_context(conn: &impl Connection, window: Window) -> Result<u32> {
+fn create_graphic_context(conn: &Conn, window: Window) -> Result<u32> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, window, &CreateGCAux::new())?;
     Ok(gc)
 }
-fn choose_visual(conn: &impl Connection, screen_num: usize) -> Result<(u8, Visualid)> {
+fn choose_visual(conn: &Conn, screen_num: usize) -> Result<(u8, Visualid)> {
     let depth = 32;
     let screen = &conn.setup().roots[screen_num];
     let has_render = conn
@@ -1726,11 +1733,7 @@ fn choose_visual(conn: &impl Connection, screen_num: usize) -> Result<(u8, Visua
     }
     Ok((screen.root_depth, screen.root_visual))
 }
-fn get_active_window(
-    conn: &impl Connection,
-    screen: &Screen,
-    atoms: &AtomCollection,
-) -> Result<Option<Window>> {
+fn get_active_window(conn: &Conn, screen: &Screen, atoms: &Atoms) -> Result<Option<Window>> {
     let prop = conn
         .get_property(
             false,
@@ -1748,11 +1751,7 @@ fn get_active_window(
         Some(wid) => Some(wid),
     }))
 }
-fn get_windows(
-    conn: &impl Connection,
-    screen: &Screen,
-    atoms: &AtomCollection,
-) -> Result<Vec<Window>> {
+fn get_windows(conn: &Conn, screen: &Screen, atoms: &Atoms) -> Result<Vec<Window>> {
     let net_client_list = conn.intern_atom(false, b"_NET_CLIENT_LIST")?.reply()?.atom;
     let prop = conn
         .get_property(
@@ -1770,7 +1769,7 @@ fn get_windows(
         .collect::<Vec<_>>();
     Ok(windows)
 }
-fn get_window_title(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Result<String> {
+fn get_window_title(conn: &Conn, atoms: &Atoms, wid: Window) -> Result<String> {
     let bytes: Result<Vec<u8>> = conn
         .get_property(
             false,
@@ -1791,11 +1790,7 @@ fn get_window_title(conn: &impl Connection, atoms: &AtomCollection, wid: Window)
         .value;
     Ok(String::from_utf8(bytes)?)
 }
-fn get_window_class(
-    conn: &impl Connection,
-    atoms: &AtomCollection,
-    wid: Window,
-) -> Result<(String, String)> {
+fn get_window_class(conn: &Conn, atoms: &Atoms, wid: Window) -> Result<(String, String)> {
     let bytes = conn
         .get_property(false, wid, atoms.WM_CLASS, atoms.STRING, 0, u32::MAX)?
         .reply()?
@@ -1811,11 +1806,7 @@ fn get_window_class(
         .unwrap_or_default();
     Ok((instance, class))
 }
-fn get_window_parent(
-    conn: &impl Connection,
-    atoms: &AtomCollection,
-    wid: Window,
-) -> Result<Option<Window>> {
+fn get_window_parent(conn: &Conn, atoms: &Atoms, wid: Window) -> Result<Option<Window>> {
     let reply = conn
         .get_property(false, wid, atoms.WM_TRANSIENT_FOR, atoms.WINDOW, 0, 1)?
         .reply()?;
@@ -1826,18 +1817,14 @@ fn get_window_parent(
         Ok(Some(window_id))
     }
 }
-fn _get_window_pid(
-    conn: &impl Connection,
-    atoms: &AtomCollection,
-    wid: Window,
-) -> Result<Option<u32>> {
+fn _get_window_pid(conn: &Conn, atoms: &Atoms, wid: Window) -> Result<Option<u32>> {
     let reply = conn
         .get_property::<_, u32>(false, wid, atoms._NET_WM_PID, atoms.CARDINAL, 0, 1)?
         .reply()?;
     let mut pids = reply.value32().ok_or_else(|| "no pid".to_string())?;
     Ok(pids.next())
 }
-fn get_net_wm_icon(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Result<Frame> {
+fn get_net_wm_icon(conn: &Conn, atoms: &Atoms, wid: Window) -> Result<Frame> {
     let reply = conn
         .get_property(false, wid, atoms._NET_WM_ICON, atoms.CARDINAL, 0, u32::MAX)?
         .reply()?;
@@ -1930,7 +1917,7 @@ fn get_dpi(db: &Database, screen: &Screen) -> Result<f32> {
     let dpi = (dpi_x + dpi_y) / 2.0;
     Ok(dpi)
 }
-fn window_to_task(conn: &impl Connection, atoms: &AtomCollection, wid: Window) -> Option<Task> {
+fn window_to_task(conn: &Conn, atoms: &Atoms, wid: Window) -> Option<Task> {
     let attr = conn.get_window_attributes(wid).ok()?.reply().ok()?;
     if attr.override_redirect {
         return None;
@@ -1959,7 +1946,7 @@ fn compute_window_geometry_row(conf: &Config, screen: &Screen, tasks: usize) -> 
     let h = task_h * tasks as f32;
     let screen_w = screen.width_in_pixels as f32;
     let screen_h = screen.height_in_pixels as f32;
-    let (x, y) = conf.location.resolve((w, h), (screen_w, screen_h));
+    let (x, y) = conf.anchor.align((w, h), (screen_w, screen_h));
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -1975,7 +1962,7 @@ fn compute_window_geometry_col(conf: &Config, screen: &Screen, tasks: usize) -> 
     let h = conf.height;
     let screen_w = screen.width_in_pixels as f32;
     let screen_h = screen.height_in_pixels as f32;
-    let (x, y) = conf.location.resolve((w, h), (screen_w, screen_h));
+    let (x, y) = conf.anchor.align((w, h), (screen_w, screen_h));
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
