@@ -262,15 +262,13 @@ impl Anchor {
     pub const BOTTOM_CENTER: Self = Self::new(0.5, 1.0);
     pub const BOTTOM_RIGHT: Self = Self::new(1.0, 1.0);
 
-    pub const fn new(x: f32, y: f32) -> Self {
+    const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
-    pub fn align(&self, pos: (f32, f32), size: (f32, f32)) -> (f32, f32) {
-        let x = pos.0;
-        let y = pos.1;
-        let w = size.0;
-        let h = size.1;
-        (x - w * self.x, y - h * self.y)
+    fn resolve(&self, (aw, ah): (f32, f32), (bw, bh): (f32, f32)) -> (f32, f32) {
+        let x = (bw - aw) * self.x;
+        let y = (bh - ah) * self.y;
+        (x, y)
     }
 }
 
@@ -1001,6 +999,9 @@ impl Frame {
         &self.buf
     }
     fn buf_u32(&self) -> &[u32] {
+        if self.width == 0 || self.height == 0 {
+            return &[];
+        }
         unsafe {
             std::slice::from_raw_parts(
                 self.buf.as_ptr() as *const u32,
@@ -1012,6 +1013,9 @@ impl Frame {
         &mut self.buf
     }
     fn buf_u32_mut(&mut self) -> &mut [u32] {
+        if self.width == 0 || self.height == 0 {
+            return &mut [];
+        }
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.buf.as_mut_ptr() as *mut u32,
@@ -1946,7 +1950,7 @@ fn compute_window_geometry_row(conf: &Config, screen: &Screen, tasks: usize) -> 
     let h = task_h * tasks as f32;
     let screen_w = screen.width_in_pixels as f32;
     let screen_h = screen.height_in_pixels as f32;
-    let (x, y) = conf.anchor.align((w, h), (screen_w, screen_h));
+    let (x, y) = conf.anchor.resolve((w, h), (screen_w, screen_h));
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -1962,7 +1966,7 @@ fn compute_window_geometry_col(conf: &Config, screen: &Screen, tasks: usize) -> 
     let h = conf.height;
     let screen_w = screen.width_in_pixels as f32;
     let screen_h = screen.height_in_pixels as f32;
-    let (x, y) = conf.anchor.align((w, h), (screen_w, screen_h));
+    let (x, y) = conf.anchor.resolve((w, h), (screen_w, screen_h));
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
